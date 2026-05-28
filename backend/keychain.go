@@ -103,8 +103,7 @@ func (k *Keychain) Delete(service string) error {
 }
 
 func (k *Keychain) Edit() error {
-	cmd := exec.Command("open", "-a", "/System/Library/CoreServices/Applications/Keychain Access.app")
-	return cmd.Run()
+	return exec.Command("open", "-b", "com.apple.keychainaccess").Start()
 }
 
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {

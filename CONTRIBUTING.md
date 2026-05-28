@@ -106,11 +106,12 @@ secret version
 secret set my-service my-account my-password
 secret login my-service        # should print: my-account
 secret password my-service     # should print: my-password
+secret edit                    # opens Keychain Access.app
 secret delete my-service
 secret version
 ```
 
-The macOS backend stores entries in the login keychain via `/usr/bin/security`. You can inspect them in **Keychain Access.app** under the login keychain to confirm the entry was created and removed correctly.
+The macOS backend stores entries in the login keychain via `/usr/bin/security`. You can inspect them in **Keychain Access.app** (opened by `secret edit`) under the login keychain to confirm the entry was created and removed correctly.
 
 ## Release dry-run (optional)
 
