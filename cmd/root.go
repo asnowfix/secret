@@ -38,5 +38,3 @@ func init() {
 }
 
 // selectBackend is implemented per-platform in backend_*.go files.
-// TODO: Support backend selection via config/env (SECRET_BACKEND).
-// TODO: Add KeePassXC backend (macOS, Windows, Linux) — cross-platform.

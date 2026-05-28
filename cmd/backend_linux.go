@@ -9,8 +9,6 @@ import (
 	"github.com/asnowfix/secret/backend"
 )
 
-// TODO: Implement GNOME libsecret / Secret Service backend (Linux only).
-
 func selectBackend() backend.Backend {
 	fmt.Fprintln(os.Stderr, "*** no backend available for linux yet")
 	os.Exit(1)

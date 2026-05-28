@@ -12,9 +12,6 @@ import (
 	"strings"
 )
 
-// TODO: Investigate using the macOS Security framework (via cgo or Swift bridging)
-// to support the Passwords.app backend, which does not have a CLI as of macOS 15.
-
 // Keychain implements Backend using the macOS /usr/bin/security CLI.
 type Keychain struct {
 	keychainPath string
