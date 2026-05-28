@@ -12,9 +12,6 @@ import (
 	"strings"
 )
 
-// TODO: Investigate using the macOS Security framework (via cgo or Swift bridging)
-// to support the Passwords.app backend, which does not have a CLI as of macOS 15.
-
 // Keychain implements Backend using the macOS /usr/bin/security CLI.
 type Keychain struct {
 	keychainPath string
@@ -103,8 +100,7 @@ func (k *Keychain) Delete(service string) error {
 }
 
 func (k *Keychain) Edit() error {
-	cmd := exec.Command("open", "-a", "/System/Library/CoreServices/Applications/Keychain Access.app")
-	return cmd.Run()
+	return exec.Command("open", "-b", "com.apple.keychainaccess").Start()
 }
 
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {

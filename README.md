@@ -65,4 +65,8 @@ go build .        # local binary
 go install .      # install to $GOPATH/bin
 ```
 
-Requires Go 1.25+.
+Requires Go 1.25+. For full contributor setup (Windows winget commands, local CI parity, PR workflow) see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Reporting Issues
+
+File a bug report or feature request at [github.com/asnowfix/secret/issues/new/choose](https://github.com/asnowfix/secret/issues/new/choose). When reporting a bug, include the output of `secret version` and your OS version.
