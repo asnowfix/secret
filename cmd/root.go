@@ -15,7 +15,7 @@ var rootCmd = &cobra.Command{
 	Short: "CLI for desktop secret managers",
 	Long:  "A unified CLI that delegates to the platform's native secret store.",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd.Name() == "help" || cmd.Name() == "completion" {
+		if cmd.Name() == "help" || cmd.Name() == "completion" || cmd.Name() == "version" {
 			return nil
 		}
 		b = selectBackend()
