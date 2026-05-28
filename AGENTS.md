@@ -33,6 +33,31 @@ This is a Cobra+Viper CLI (`main.go` → `cmd/` → `backend/`) that abstracts p
 2. Implement `backend.Backend`.
 3. Wire it into the appropriate `cmd/backend_<os>.go` file's `selectBackend()`.
 
+## Running CI steps locally
+
+Mirrors what the `ci.yml` workflow runs on every PR:
+
+```sh
+go build ./...
+go vet ./...
+go test ./...
+```
+
+Build with version injection (matches what a release binary reports):
+
+```sh
+go build -ldflags "-X github.com/asnowfix/secret/cmd.version=$(git describe --tags --always --dirty)" .
+./secret version
+```
+
+Dry-run the release pipeline locally (requires `goreleaser` in PATH):
+
+```sh
+goreleaser check                                  # validate .goreleaser.yaml
+goreleaser release --snapshot --clean --skip=publish  # build all release artefacts without publishing
+# inspect ./dist/ for archives + checksums.txt
+```
+
 ## Commits and PRs
 
 Do NOT include `Co-Authored-By` trailers or `Generated with Claude Code` strings in commit messages or PR descriptions.
