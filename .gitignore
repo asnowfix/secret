@@ -33,3 +33,4 @@ secret
 # Editor/IDE
 # .idea/
 # .vscode/
+.claude/settings.local.json

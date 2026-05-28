@@ -45,10 +45,18 @@ Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `pas
 | Backend | Platform | Status |
 |---------|----------|--------|
 | macOS Keychain (`/usr/bin/security`) | macOS | Implemented |
+| Windows Credential Manager | Windows | Implemented |
 | Passwords.app (Security framework) | macOS | Planned |
 | GNOME libsecret / Secret Service | Linux | Planned |
-| Windows Credential Manager | Windows | Planned |
 | KeePassXC | macOS, Linux, Windows | Planned |
+
+### Windows Credential Manager
+
+Credentials are stored as **Generic** entries (`CRED_TYPE_GENERIC`) with machine-level persistence (`CRED_PERSIST_LOCAL_MACHINE`), making them available to all processes on the machine under the current user account.
+
+The implementation calls `Advapi32.dll` directly via Go syscalls — no cgo, no third-party library. Passwords are stored as UTF-16LE blobs, matching Windows' native string encoding for credential data.
+
+`secret edit` opens the built-in Credential Manager UI (`control.exe /name Microsoft.CredentialManager`) where stored entries are visible under **Windows Credentials → Generic Credentials**.
 
 ## Building
 
