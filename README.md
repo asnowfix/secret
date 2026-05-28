@@ -33,7 +33,7 @@ Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows
 ```sh
 secret login <service>          # retrieve account/username
 secret password <service>       # retrieve password
-secret add <service> [account] <password>  # store credential
+secret set <service> [account] <password>  # store credential (overwrites if exists)
 secret delete <service>         # remove credential
 secret edit                     # open native UI
 ```
