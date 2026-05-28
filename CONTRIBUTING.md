@@ -1,8 +1,30 @@
 # Contributing to secret
 
-This guide covers setting up a local development environment on Windows, building and testing the project, and submitting a pull request. For architecture details and AI agent guidance see [AGENTS.md](AGENTS.md).
+This guide covers setting up a local development environment on Windows or macOS, building and testing the project, and submitting a pull request. For architecture details and AI agent guidance see [AGENTS.md](AGENTS.md).
 
-> macOS prerequisites will be added in a follow-up commit on this PR.
+## Prerequisites — macOS
+
+Install the following tools via [Homebrew](https://brew.sh):
+
+```sh
+brew install go               # Go 1.25+ (CI uses 1.25; any later release works)
+brew install gh               # GitHub CLI — used for cloning and creating PRs
+brew install goreleaser       # for release dry-runs
+```
+
+`git` ships with Xcode Command Line Tools. If not already installed, run:
+
+```sh
+xcode-select --install
+```
+
+After installation, verify the tools are on your `PATH`:
+
+```sh
+go version && git --version && gh --version && goreleaser --version
+```
+
+No extra C toolchain configuration is required — the macOS backend calls the built-in `/usr/bin/security` CLI via `os/exec` (`CGO_ENABLED=0`).
 
 ## Prerequisites — Windows
 
@@ -77,6 +99,18 @@ secret edit                    # opens Windows Credential Manager UI
 secret delete my-service
 secret version
 ```
+
+## Manual smoke test (macOS)
+
+```sh
+secret set my-service my-account my-password
+secret login my-service        # should print: my-account
+secret password my-service     # should print: my-password
+secret delete my-service
+secret version
+```
+
+The macOS backend stores entries in the login keychain via `/usr/bin/security`. You can inspect them in **Keychain Access.app** under the login keychain to confirm the entry was created and removed correctly.
 
 ## Release dry-run (optional)
 
