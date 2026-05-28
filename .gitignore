@@ -34,3 +34,4 @@ secret
 # .idea/
 # .vscode/
 .claude/settings.local.json
+dist/
