@@ -13,6 +13,7 @@ builds:
       - CGO_ENABLED=0
     goos:
       - darwin
+      - linux
       - windows
     goarch:
       - amd64
@@ -37,3 +38,36 @@ checksum:
 release:
   draft: false
   prerelease: auto
+
+scoop:
+  - name: secret
+    repository:
+      owner: asnowfix
+      name: scoop-secret
+    homepage: https://github.com/asnowfix/secret
+    description: Cross-platform CLI for native secret stores
+    license: Apache-2.0
+    skip_upload: auto
+
+winget:
+  - name: secret
+    publisher: asnowfix
+    publisher_url: https://github.com/asnowfix/secret
+    publisher_support_url: https://github.com/asnowfix/secret/issues
+    homepage: https://github.com/asnowfix/secret
+    short_description: Cross-platform CLI for native secret stores
+    license: Apache-2.0
+    license_url: https://github.com/asnowfix/secret/blob/main/LICENSE
+    package_identifier: asnowfix.secret
+    repository:
+      owner: asnowfix
+      name: winget-pkgs
+      branch: "secret-{{.Version}}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+    skip_upload: auto
