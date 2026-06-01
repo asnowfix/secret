@@ -70,10 +70,11 @@ go build -ldflags "-X github.com/asnowfix/secret/cmd.version=$(git describe --ta
 ./secret version
 ```
 
-Cross-compile sanity check — both platforms must build cleanly because the CI matrix covers Windows and macOS:
+Cross-compile sanity check — all three platforms must build cleanly because the CI matrix covers Linux, macOS, and Windows:
 
 ```sh
 GOOS=darwin go build ./...
+GOOS=linux go build ./...
 GOOS=windows go build ./...
 ```
 
@@ -112,6 +113,41 @@ secret version
 ```
 
 The macOS backend stores entries in the login keychain via `/usr/bin/security`. You can inspect them in **Keychain Access.app** (opened by `secret edit`) under the login keychain to confirm the entry was created and removed correctly.
+
+## Publishing a release
+
+Releases are fully automated via `.github/workflows/release.yml`. Pushing a version tag triggers goreleaser, which:
+
+1. Builds binaries for Linux, macOS, and Windows.
+2. Creates a GitHub Release and uploads the archives.
+3. Commits a Scoop manifest to [`asnowfix/scoop-secret`](https://github.com/asnowfix/scoop-secret).
+4. Opens a PR against [`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs) via the [`asnowfix/winget-pkgs`](https://github.com/asnowfix/winget-pkgs) fork.
+
+Steps 3 and 4 write to repositories outside `asnowfix/secret`, so `GITHUB_TOKEN` (which is scoped to the current repo) is not sufficient. The workflow uses a `GH_PAT` secret instead.
+
+### Setting up GH_PAT
+
+goreleaser needs a token with **Contents: Read & Write** and **Pull requests: Read & Write** access to both `asnowfix/scoop-secret` and `asnowfix/winget-pkgs`.
+
+**Fine-grained PAT — current limitation:** GitHub's fine-grained PAT UI does not currently allow selecting forked repositories (such as `winget-pkgs`) as individual resource targets. Until that restriction is lifted, use a **classic PAT** instead:
+
+1. Go to **github.com/settings/tokens** → **Generate new token (classic)**.
+2. Select the `repo` scope (full repository access).
+3. Set an expiry appropriate for your release cadence.
+4. Copy the generated token.
+5. In the `asnowfix/secret` repository go to **Settings → Secrets and variables → Actions → New repository secret**.
+6. Name: `GH_PAT`, value: the token you copied.
+
+Once GitHub lifts the fine-grained PAT restriction on forks, you can replace the classic token with a fine-grained one scoped only to `asnowfix/scoop-secret` and `asnowfix/winget-pkgs`.
+
+### Triggering a release
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The CI job runs goreleaser and handles everything else. The winget PR is reviewed and merged by Microsoft's automated validation pipeline (typically within a few hours).
 
 ## Release dry-run (optional)
 
