@@ -64,6 +64,14 @@ winget install asnowfix.secret
 
 **2. Install the Linux `secret` binary inside WSL:**
 
+If Go is not already installed:
+
+```sh
+sudo snap install go --classic
+```
+
+Then install `secret`:
+
 ```sh
 go install github.com/asnowfix/secret@latest
 ```
