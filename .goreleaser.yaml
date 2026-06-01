@@ -39,7 +39,7 @@ release:
   draft: false
   prerelease: auto
 
-scoop:
+scoops:
   - name: secret
     repository:
       owner: asnowfix
