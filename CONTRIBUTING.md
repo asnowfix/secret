@@ -135,8 +135,11 @@ goreleaser needs a token with **Contents: Read & Write** and **Pull requests: Re
 2. Select the `repo` scope (full repository access).
 3. Set an expiry appropriate for your release cadence.
 4. Copy the generated token.
-5. In the `asnowfix/secret` repository go to **Settings → Secrets and variables → Actions → New repository secret**.
-6. Name: `GH_PAT`, value: the token you copied.
+5. Store the token as a repository secret using the GitHub CLI:
+   ```sh
+   gh secret set GH_PAT --repo asnowfix/secret
+   ```
+   `gh` will prompt you to paste the value (input is hidden and never stored in shell history).
 
 Once GitHub lifts the fine-grained PAT restriction on forks, you can replace the classic token with a fine-grained one scoped only to `asnowfix/scoop-secret` and `asnowfix/winget-pkgs`.
 
