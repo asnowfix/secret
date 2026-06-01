@@ -82,6 +82,33 @@ After that, `secret` works transparently from your WSL shell — credentials are
 
 If `secret.exe` is not found on the Windows `PATH`, `secret` will print an error with installation instructions.
 
+#### Scoop installed after WSL was already running
+
+WSL takes a snapshot of the Windows `PATH` at launch. If you installed Scoop (or `secret`) after your WSL session was already open, WSL won't see Scoop's shims directory yet and `secret.exe` will appear missing.
+
+First, make sure Scoop's shims directory is in your **permanent** Windows user `PATH` (from PowerShell):
+
+```powershell
+# Check — should print a line containing "scoop\shims"
+[Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Select-String "scoop"
+
+# If missing, add it:
+$old = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$old;$env:USERPROFILE\scoop\shims", "User")
+```
+
+Then restart WSL so it picks up the updated `PATH`:
+
+```powershell
+wsl --shutdown
+```
+
+Reopen your WSL terminal and verify:
+
+```sh
+which secret.exe
+```
+
 ## Usage
 
 ```sh
