@@ -28,6 +28,52 @@ Provide a single `secret` binary that works identically across macOS, Linux, and
 
 Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`), with runtime override planned via `SECRET_BACKEND` env var.
 
+## Installation
+
+### macOS
+
+```sh
+go install github.com/asnowfix/secret@latest
+```
+
+Or download the `darwin` archive from the [releases page](https://github.com/asnowfix/secret/releases) and place the binary on your `PATH`.
+
+### Windows
+
+```powershell
+winget install asnowfix.secret
+```
+
+Or via [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add asnowfix https://github.com/asnowfix/scoop-secret
+scoop install secret
+```
+
+### WSL (Windows Subsystem for Linux)
+
+The Linux `secret` binary auto-detects WSL and trampolines every command to `secret.exe` on the Windows host. Two steps are required:
+
+**1. Install `secret.exe` on the Windows host** (from a PowerShell or cmd prompt, not inside WSL):
+
+```powershell
+winget install asnowfix.secret
+# or: scoop bucket add asnowfix https://github.com/asnowfix/scoop-secret && scoop install secret
+```
+
+**2. Install the Linux `secret` binary inside WSL:**
+
+```sh
+go install github.com/asnowfix/secret@latest
+```
+
+Or download the `linux` archive from the [releases page](https://github.com/asnowfix/secret/releases) and place the binary on your `PATH`.
+
+After that, `secret` works transparently from your WSL shell — credentials are stored in the Windows Credential Manager on the host.
+
+If `secret.exe` is not found on the Windows `PATH`, `secret` will print an error with installation instructions.
+
 ## Usage
 
 ```sh
@@ -46,6 +92,7 @@ Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `pas
 |---------|----------|--------|
 | macOS Keychain (`/usr/bin/security`) | macOS | Implemented |
 | Windows Credential Manager | Windows | Implemented |
+| WSL trampoline → `secret.exe` | WSL | Implemented |
 | Passwords.app (Security framework) | macOS | Planned |
 | GNOME libsecret / Secret Service | Linux | Planned |
 | KeePassXC | macOS, Linux, Windows | Planned |
