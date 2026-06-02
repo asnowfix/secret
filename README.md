@@ -19,14 +19,15 @@ Provide a single `secret` binary that works identically across macOS, Linux, and
 │              backend.Backend interface           │
 │  IsAvailable · GetUsername · GetPassword         │
 │  Add · Delete · Edit                            │
-└────┬───────────┬───────────┬───────────┬────────┘
-     │           │           │           │
-     ▼           ▼           ▼           ▼
- Keychain    libsecret   Win Cred    KeePassXC
- (macOS)     (Linux)     (Windows)   (cross-platform)
+└────┬──────────┬──────────┬──────────┬───────────┘
+     │          │          │          │
+     ▼          ▼          ▼          ▼
+Passwords.app  Keychain  Win Cred  libsecret
+(macOS 15+)   (macOS,   (Windows)  (Linux,
+              fallback)             planned)
 ```
 
-Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`), with runtime override planned via `SECRET_BACKEND` env var.
+Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`). On macOS, `selectBackend()` prefers `PasswordsApp` when available and falls back to `Keychain`; pass `--keychain` / `-k` to force the fallback at runtime.
 
 ## Installation
 
@@ -98,12 +99,36 @@ Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `pas
 
 | Backend | Platform | Status |
 |---------|----------|--------|
-| macOS Keychain (`/usr/bin/security`) | macOS | Implemented |
+| Passwords.app (Security framework, cgo) | macOS 15+ | Implemented — default on macOS 15+ |
+| macOS Keychain (`/usr/bin/security`) | macOS | Implemented — fallback on macOS < 15; selectable via `--keychain` |
 | Windows Credential Manager | Windows | Implemented |
 | WSL trampoline → `secret.exe` | WSL | Implemented |
-| Passwords.app (Security framework) | macOS | Planned |
+| Passwords.app: Safari/iCloud credentials | macOS 15+ | Planned — requires code signing + entitlements ([#20](https://github.com/asnowfix/secret/issues/20)) |
 | GNOME libsecret / Secret Service | Linux | Planned |
 | KeePassXC | macOS, Linux, Windows | Planned |
+
+### macOS — Passwords.app (default on macOS 15+)
+
+Calls `SecItemCopyMatching`, `SecItemAdd`, and `SecItemDelete` from the Security framework directly via cgo. Unlike the Keychain backend, it does not hardcode `login.keychain-db` — it searches the default keychain list, which includes iCloud-synced items.
+
+Both `kSecClassGenericPassword` (by `kSecAttrService`) and `kSecClassInternetPassword` (by `kSecAttrServer`) are tried on reads and deletes, so browser-saved entries are returned alongside credentials added by `secret`. Writes always use `kSecClassGenericPassword`.
+
+`secret edit` opens Passwords.app (`com.apple.Passwords`), which shows all credential types in one view.
+
+> **Limitation**: credentials saved by Safari are stored in the data-protection keychain with access controls that block unsigned processes. `secret` can read and write credentials it manages itself; accessing Safari-saved credentials requires a signed binary with the `keychain-access-groups` entitlement ([#20](https://github.com/asnowfix/secret/issues/20)).
+
+#### Forcing the Keychain backend on macOS
+
+Pass `--keychain` / `-k` to any command to route it through the `login.keychain-db` backend instead:
+
+```sh
+secret -k password myservice
+secret -k set myservice user pass
+```
+
+### macOS — Keychain (fallback / macOS < 15)
+
+Shells out to `/usr/bin/security` targeting `~/Library/Keychains/login.keychain-db`. Used automatically on macOS < 15, or when `--keychain` is passed.
 
 ### Windows Credential Manager
 
