@@ -6,13 +6,25 @@ before:
     - go mod tidy
 
 builds:
-  - id: secret
+  - id: secret-darwin
+    main: .
+    binary: secret
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/asnowfix/secret/cmd.version={{ .Tag }}
+
+  - id: secret-other
     main: .
     binary: secret
     env:
       - CGO_ENABLED=0
     goos:
-      - darwin
       - linux
       - windows
     goarch:
