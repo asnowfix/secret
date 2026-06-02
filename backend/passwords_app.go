@@ -34,13 +34,14 @@ static char* _cfstring_to_cstr(CFStringRef s) {
 
 // sec_copy_password returns the password for name as a malloc'd string (caller must free),
 // or NULL if not found. Tries kSecClassGenericPassword then kSecClassInternetPassword.
+// kSecAttrSynchronizableAny is included so iCloud-synced Passwords.app items are searched.
 static char* sec_copy_password(const char *name, OSStatus *st) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 	{
-		const void *k[] = {kSecClass, kSecAttrService, kSecReturnData, kSecMatchLimit};
-		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+		const void *k[] = {kSecClass, kSecAttrService, kSecReturnData, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
 		*st = SecItemCopyMatching(q, &r);
@@ -53,9 +54,9 @@ static char* sec_copy_password(const char *name, OSStatus *st) {
 	}
 
 	{
-		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnData, kSecMatchLimit};
-		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnData, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
 		*st = SecItemCopyMatching(q, &r);
@@ -73,13 +74,14 @@ static char* sec_copy_password(const char *name, OSStatus *st) {
 
 // sec_copy_username returns the account name for name as a malloc'd string (caller must free),
 // or NULL if not found. Tries kSecClassGenericPassword then kSecClassInternetPassword.
+// kSecAttrSynchronizableAny is included so iCloud-synced Passwords.app items are searched.
 static char* sec_copy_username(const char *name, OSStatus *st) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 	{
-		const void *k[] = {kSecClass, kSecAttrService, kSecReturnAttributes, kSecMatchLimit};
-		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+		const void *k[] = {kSecClass, kSecAttrService, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
 		*st = SecItemCopyMatching(q, &r);
@@ -93,9 +95,9 @@ static char* sec_copy_username(const char *name, OSStatus *st) {
 	}
 
 	{
-		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnAttributes, kSecMatchLimit};
-		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
 		*st = SecItemCopyMatching(q, &r);
@@ -128,14 +130,15 @@ static OSStatus sec_add_generic_password(const char *service, const char *accoun
 
 // sec_delete_item deletes an item by service name.
 // Tries kSecClassGenericPassword then kSecClassInternetPassword.
+// kSecAttrSynchronizableAny ensures iCloud-synced items can be deleted too.
 static OSStatus sec_delete_item(const char *name) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 	OSStatus st;
 
 	{
-		const void *k[] = {kSecClass, kSecAttrService};
-		const void *v[] = {kSecClassGenericPassword, n};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 2,
+		const void *k[] = {kSecClass, kSecAttrService, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, n, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 3,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		st = SecItemDelete(q);
 		CFRelease(q);
@@ -143,9 +146,9 @@ static OSStatus sec_delete_item(const char *name) {
 	}
 
 	{
-		const void *k[] = {kSecClass, kSecAttrServer};
-		const void *v[] = {kSecClassInternetPassword, n};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 2,
+		const void *k[] = {kSecClass, kSecAttrServer, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, n, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 3,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		st = SecItemDelete(q);
 		CFRelease(q);
