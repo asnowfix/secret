@@ -4,6 +4,8 @@ project_name: secret
 before:
   hooks:
     - go mod tidy
+    - go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+    - goversioninfo -o resource.syso
 
 builds:
   - id: secret-darwin
@@ -19,22 +21,30 @@ builds:
     ldflags:
       - -s -w -X github.com/asnowfix/secret/cmd.version={{ .Tag }}
 
-  - id: secret-other
+  - id: secret-linux
     main: .
     binary: secret
     env:
       - CGO_ENABLED=0
     goos:
       - linux
-      - windows
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
     ldflags:
       - -s -w -X github.com/asnowfix/secret/cmd.version={{ .Tag }}
+
+  - id: secret-windows
+    main: .
+    binary: secret
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+    ldflags:
+      - -X github.com/asnowfix/secret/cmd.version={{ .Tag }}
 
 archives:
   - id: secret
