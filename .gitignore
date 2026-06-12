@@ -28,7 +28,7 @@ go.work.sum
 secret
 
 # Generated Windows resource file (produced by goversioninfo during release)
-resource.syso
+resource_windows.syso
 
 # env file
 .env

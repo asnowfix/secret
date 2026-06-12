@@ -5,7 +5,7 @@ before:
   hooks:
     - go mod tidy
     - go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
-    - goversioninfo -o resource.syso
+    - goversioninfo -o resource_windows.syso
 
 builds:
   - id: secret-darwin
