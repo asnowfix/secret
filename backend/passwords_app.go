@@ -128,6 +128,72 @@ static OSStatus sec_add_generic_password(const char *service, const char *accoun
 	return st;
 }
 
+// sec_copy_all_services returns all service/server names as a "\n"-joined,
+// malloc'd C string (caller must free), or NULL if none were found. Searches
+// both kSecClassGenericPassword and kSecClassInternetPassword, including
+// iCloud-synced Passwords.app items.
+static char* sec_copy_all_services(OSStatus *st) {
+	CFMutableStringRef out = CFStringCreateMutable(NULL, 0);
+	int found = 0;
+
+	{
+		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFTypeRef r = NULL;
+		*st = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*st == errSecSuccess && r) {
+			CFArrayRef arr = (CFArrayRef)r;
+			CFIndex n = CFArrayGetCount(arr);
+			for (CFIndex i = 0; i < n; i++) {
+				CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+				CFStringRef svc = CFDictionaryGetValue(item, kSecAttrService);
+				if (svc) {
+					if (found) CFStringAppend(out, CFSTR("\n"));
+					CFStringAppend(out, svc);
+					found = 1;
+				}
+			}
+			CFRelease(r);
+		}
+	}
+
+	{
+		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFTypeRef r = NULL;
+		*st = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*st == errSecSuccess && r) {
+			CFArrayRef arr = (CFArrayRef)r;
+			CFIndex n = CFArrayGetCount(arr);
+			for (CFIndex i = 0; i < n; i++) {
+				CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+				CFStringRef svc = CFDictionaryGetValue(item, kSecAttrServer);
+				if (svc) {
+					if (found) CFStringAppend(out, CFSTR("\n"));
+					CFStringAppend(out, svc);
+					found = 1;
+				}
+			}
+			CFRelease(r);
+		}
+	}
+
+	*st = errSecSuccess;
+	if (!found) {
+		CFRelease(out);
+		return NULL;
+	}
+	char *result = _cfstring_to_cstr(out);
+	CFRelease(out);
+	return result;
+}
+
 // sec_delete_item deletes an item by service name.
 // Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny ensures iCloud-synced items can be deleted too.
@@ -164,6 +230,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"unsafe"
 )
 
@@ -233,4 +301,31 @@ func (p *PasswordsApp) Delete(service string) error {
 
 func (p *PasswordsApp) Edit() error {
 	return exec.Command("open", "-b", "com.apple.Passwords").Start()
+}
+
+func (p *PasswordsApp) List() ([]string, error) {
+	var st C.OSStatus
+	raw := C.sec_copy_all_services(&st)
+	if raw == nil {
+		return []string{}, nil
+	}
+	defer C.free(unsafe.Pointer(raw))
+	return dedupeSortedServices(C.GoString(raw)), nil
+}
+
+// dedupeSortedServices splits a "\n"-joined list of service names, drops
+// empty entries and duplicates, and returns them sorted.
+func dedupeSortedServices(joined string) []string {
+	names := strings.Split(joined, "\n")
+	seen := make(map[string]bool, len(names))
+	services := make([]string, 0, len(names))
+	for _, n := range names {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		services = append(services, n)
+	}
+	sort.Strings(services)
+	return services
 }

@@ -21,6 +21,9 @@ type Backend interface {
 
 	// Edit opens the backend's native UI for credential management.
 	Edit() error
+
+	// List returns the service names of all secrets available in this backend, sorted.
+	List() ([]string, error)
 }
 
 // ErrNotFound is returned when a credential cannot be found.

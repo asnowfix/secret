@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"sort"
 	"syscall"
 	"unsafe"
 
@@ -26,16 +27,22 @@ import (
 )
 
 var (
-	advapi32       = windows.NewLazySystemDLL("Advapi32.dll")
-	procCredRead   = advapi32.NewProc("CredReadW")
-	procCredWrite  = advapi32.NewProc("CredWriteW")
-	procCredDelete = advapi32.NewProc("CredDeleteW")
-	procCredFree   = advapi32.NewProc("CredFree")
+	advapi32          = windows.NewLazySystemDLL("Advapi32.dll")
+	procCredRead      = advapi32.NewProc("CredReadW")
+	procCredWrite     = advapi32.NewProc("CredWriteW")
+	procCredDelete    = advapi32.NewProc("CredDeleteW")
+	procCredFree      = advapi32.NewProc("CredFree")
+	procCredEnumerate = advapi32.NewProc("CredEnumerateW")
 )
 
 const (
 	credTypeGeneric         uint32 = 1
 	credPersistLocalMachine uint32 = 2
+
+	// credEnumerateAllCredentials must be set when Filter is NULL to enumerate
+	// every credential in the caller's credential set, not just the current
+	// logon session's.
+	credEnumerateAllCredentials uint32 = 0x1
 )
 
 // nativeCredential mirrors the CREDENTIALW struct from wincred.h.
@@ -145,6 +152,41 @@ func (c *CredentialManager) Delete(service string) error {
 
 func (c *CredentialManager) Edit() error {
 	return exec.Command("control.exe", "/name", "Microsoft.CredentialManager").Start()
+}
+
+func (c *CredentialManager) List() ([]string, error) {
+	var count uint32
+	var pCreds **nativeCredential
+	r, _, e := procCredEnumerate.Call(
+		0, // Filter: NULL enumerates all credentials (with the flag below)
+		uintptr(credEnumerateAllCredentials),
+		uintptr(unsafe.Pointer(&count)),
+		uintptr(unsafe.Pointer(&pCreds)),
+	)
+	if r == 0 {
+		if e == windows.ERROR_NOT_FOUND {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to enumerate credentials: %w", e)
+	}
+	defer procCredFree.Call(uintptr(unsafe.Pointer(pCreds)))
+
+	credPtrs := unsafe.Slice(pCreds, count)
+	return filterGenericTargetNames(credPtrs), nil
+}
+
+// filterGenericTargetNames extracts the target (service) names of
+// CRED_TYPE_GENERIC credentials, sorted.
+func filterGenericTargetNames(creds []*nativeCredential) []string {
+	services := make([]string, 0, len(creds))
+	for _, cred := range creds {
+		if cred.Type != credTypeGeneric || cred.TargetName == nil {
+			continue
+		}
+		services = append(services, windows.UTF16PtrToString(cred.TargetName))
+	}
+	sort.Strings(services)
+	return services
 }
 
 func credReadW(service string) (*nativeCredential, error) {

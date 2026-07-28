@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -35,6 +36,10 @@ func (k *Keychain) IsAvailable() error {
 }
 
 var acctRegexp = regexp.MustCompile(`^\s+"acct"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
+
+// svceRegexp matches the "svce" (generic password) or "srvr" (internet password)
+// attribute lines emitted by `security dump-keychain`.
+var svceRegexp = regexp.MustCompile(`^\s+"(?:svce|srvr)"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
 
 func (k *Keychain) GetUsername(service string) (string, error) {
 	output, err := k.findPassword(service, false)
@@ -101,6 +106,53 @@ func (k *Keychain) Delete(service string) error {
 
 func (k *Keychain) Edit() error {
 	return exec.Command("open", "-b", "com.apple.keychainaccess").Start()
+}
+
+func (k *Keychain) List() ([]string, error) {
+	cmd := exec.Command("/usr/bin/security", "dump-keychain", k.keychainPath)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("failed to list secrets: %s", strings.TrimSpace(stderr.String()))
+	}
+	return parseKeychainDumpServices(stdout.String()), nil
+}
+
+// parseKeychainDumpServices extracts the deduplicated, sorted set of service
+// names from `security dump-keychain` output, matching "svce" (generic
+// password) and "srvr" (internet password) attribute lines.
+func parseKeychainDumpServices(dump string) []string {
+	seen := make(map[string]bool)
+	var services []string
+	for _, line := range strings.Split(dump, "\n") {
+		m := svceRegexp.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+
+		var name string
+		switch {
+		case m[1] != "":
+			name = m[1]
+		case m[2] != "":
+			decoded, err := hexDecode(m[2])
+			if err != nil {
+				continue
+			}
+			name = decoded
+		default:
+			continue
+		}
+
+		if !seen[name] {
+			seen[name] = true
+			services = append(services, name)
+		}
+	}
+	sort.Strings(services)
+	return services
 }
 
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {
