@@ -69,8 +69,59 @@ const (
 
 // promptWaitTimeout bounds how long we wait for a user to respond to a
 // Secret Service unlock/create prompt (e.g. a GUI "unlock your keyring"
-// dialog) before giving up.
+// dialog) before giving up. It is deliberately much longer than
+// dbusCallTimeout below because a human, not the provider, is on the other
+// end of it.
 const promptWaitTimeout = 2 * time.Minute
+
+// dbusCallTimeout bounds every other D-Bus round trip this backend makes
+// (session setup, search, unlock request, secret read/write, property
+// reads). Without an explicit bound, godbus's (*dbus.Object).Call uses
+// context.Background() with no library-level default, so a provider that is
+// registered on the bus but wedged — or a bus that never replies — would
+// hang the call forever. Because PersistentPreRunE (cmd/root.go) calls
+// IsAvailable() before every subcommand, an unbounded connect() alone would
+// hang the entire CLI with no output. 10s is generous for a local,
+// per-user D-Bus socket talking to a provider that is actually alive, while
+// still bounded enough to fail fast and produce an actionable
+// *ErrUnavailable when it is not.
+const dbusCallTimeout = 10 * time.Second
+
+// callCtx returns a context bounded by dbusCallTimeout, for use with
+// CallWithContext on every D-Bus method call except the prompt wait (which
+// uses promptWaitTimeout instead).
+func callCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), dbusCallTimeout)
+}
+
+// getPropertyTimeout reads a D-Bus property, bounding the wait to
+// dbusCallTimeout. dbus.BusObject has no context-aware GetProperty variant
+// (unlike Call/CallWithContext), so this bounds it from the outside: if
+// GetProperty has not returned within the timeout, this returns an
+// *ErrUnavailable instead of blocking forever. The abandoned goroutine
+// (GetProperty itself isn't cancellable) is not a leak in practice — the
+// process either moves on to report the error, or the CLI is exiting
+// anyway.
+func getPropertyTimeout(obj dbus.BusObject, prop string) (dbus.Variant, error) {
+	type result struct {
+		v   dbus.Variant
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := obj.GetProperty(prop)
+		ch <- result{v, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return dbus.Variant{}, classifyBusError(r.err)
+		}
+		return r.v, nil
+	case <-time.After(dbusCallTimeout):
+		return dbus.Variant{}, &ErrUnavailable{Reason: fmt.Sprintf("timed out after %s waiting for Secret Service property %s", dbusCallTimeout, prop)}
+	}
+}
 
 // secretValue mirrors the Secret Service API's "Secret" D-Bus struct:
 // (session: ObjectPath, parameters: Array<Byte>, value: Array<Byte>,
@@ -95,8 +146,11 @@ type objectFunc func(dest string, path dbus.ObjectPath) dbus.BusObject
 type promptFunc func(path dbus.ObjectPath) (dbus.Variant, error)
 
 // SecretService implements Backend via the freedesktop.org Secret Service
-// D-Bus API, covering GNOME Keyring and any other provider implementing the
-// same spec (e.g. KWallet's ksecretd).
+// D-Bus API. This is a generic client against the spec, not a GNOME-only
+// integration, so it should in principle also work against KWallet's
+// ksecretd (which implements the same D-Bus interface) — but that has never
+// actually been run or tested; only gnome-keyring-daemon has. Treat the
+// KWallet case as untested, not verified.
 type SecretService struct {
 	conn    *dbus.Conn
 	session dbus.ObjectPath
@@ -125,7 +179,9 @@ func (s *SecretService) connect() error {
 	}
 	object := func(dest string, path dbus.ObjectPath) dbus.BusObject { return conn.Object(dest, path) }
 
-	call := object(secretsDest, secretsPath).Call(ifaceService+".OpenSession", 0, "plain", dbus.MakeVariant(""))
+	ctx, cancel := callCtx()
+	defer cancel()
+	call := object(secretsDest, secretsPath).CallWithContext(ctx, ifaceService+".OpenSession", 0, "plain", dbus.MakeVariant(""))
 	if call.Err != nil {
 		conn.Close()
 		return classifyBusError(call.Err)
@@ -164,7 +220,13 @@ func (s *SecretService) GetUsername(service string) (string, error) {
 	}
 	attrs, err := s.itemAttributes(item)
 	if err != nil {
-		return "", &ErrNotFound{Service: service}
+		// resolveItem already found this item and unlocked it if needed, so
+		// "not found" would be a lie here: the item demonstrably exists.
+		// This is a read failure (transport fault, item re-locked between
+		// resolve and read, etc.) — surface it as such rather than as
+		// ErrNotFound, which callers (notably cmd/set.go's overwrite check)
+		// treat as "safe to proceed without confirmation".
+		return "", fmt.Errorf("failed to read username for '%s': %w", service, err)
 	}
 	return attrs[attrUsername], nil
 }
@@ -178,13 +240,19 @@ func (s *SecretService) GetPassword(service string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	call := s.object(secretsDest, item).Call(ifaceItem+".GetSecret", 0, s.session)
+	ctx, cancel := callCtx()
+	defer cancel()
+	call := s.object(secretsDest, item).CallWithContext(ctx, ifaceItem+".GetSecret", 0, s.session)
 	if call.Err != nil {
-		return "", &ErrNotFound{Service: service}
+		// See the comment in GetUsername above: resolveItem already found
+		// this item, so a GetSecret failure here is never "not found" — it
+		// is a read failure (e.g. the item re-locked between resolve and
+		// read), and must not be reported as ErrNotFound.
+		return "", fmt.Errorf("failed to read secret for '%s': %w", service, classifyBusError(call.Err))
 	}
 	var sec secretValue
 	if err := call.Store(&sec); err != nil {
-		return "", &ErrNotFound{Service: service}
+		return "", fmt.Errorf("failed to read secret for '%s': unexpected reply from Secret Service GetSecret: %w", service, err)
 	}
 	return string(sec.Value), nil
 }
@@ -212,7 +280,9 @@ func (s *SecretService) Add(service, account, password string) error {
 		Value:       []byte(password),
 		ContentType: "text/plain; charset=utf8",
 	}
-	call := s.coll().Call(ifaceCollection+".CreateItem", 0, props, sec, true)
+	ctx, cancel := callCtx()
+	defer cancel()
+	call := s.coll().CallWithContext(ctx, ifaceCollection+".CreateItem", 0, props, sec, true)
 	if call.Err != nil {
 		return fmt.Errorf("failed to add secret for '%s': %w", service, classifyBusError(call.Err))
 	}
@@ -229,7 +299,15 @@ func (s *SecretService) Add(service, account, password string) error {
 }
 
 // Delete removes every item tagged with attrService == service, across all
-// collections, unlocking locked ones first if needed.
+// collections. It does *not* unlock locked items first: per the Secret
+// Service spec, Item.Delete removes the item's metadata and secret without
+// requiring the caller to have read the secret first, and gnome-keyring
+// (the only provider this backend has been run against) accepts Delete on
+// a locked item directly. If some other provider's Delete call does
+// require the item to be unlocked first, the D-Bus call below will fail —
+// and, since that failure is otherwise indistinguishable from any other
+// transport fault, the error for a locked item calls out that possibility
+// explicitly rather than reporting a generic "backend down".
 func (s *SecretService) Delete(service string) error {
 	if err := s.connect(); err != nil {
 		return err
@@ -242,10 +320,22 @@ func (s *SecretService) Delete(service string) error {
 	if len(items) == 0 {
 		return &ErrNotFound{Service: service}
 	}
+	isLocked := make(map[dbus.ObjectPath]bool, len(locked))
+	for _, l := range locked {
+		isLocked[l] = true
+	}
 	for _, item := range items {
-		call := s.object(secretsDest, item).Call(ifaceItem+".Delete", 0)
+		ctx, cancel := callCtx()
+		call := s.object(secretsDest, item).CallWithContext(ctx, ifaceItem+".Delete", 0)
+		cancel()
 		if call.Err != nil {
-			return fmt.Errorf("failed to delete secret for '%s': %w", service, classifyBusError(call.Err))
+			classified := classifyBusError(call.Err)
+			if isLocked[item] {
+				classified = &ErrUnavailable{Reason: fmt.Sprintf(
+					"the item is locked and this Secret Service provider appears to require unlocking before delete (%v)", classified,
+				)}
+			}
+			return fmt.Errorf("failed to delete secret for '%s': %w", service, classified)
 		}
 		var promptPath dbus.ObjectPath
 		if err := call.Store(&promptPath); err == nil && promptPath != rootPath {
@@ -262,11 +352,17 @@ func (s *SecretService) Delete(service string) error {
 // each Collection's Items property, then reading each item's Attributes.
 // Attribute metadata is public (unlike the secret value itself), so this
 // works without unlocking anything.
+//
+// A collection or item that cannot be read fails the whole call rather than
+// being silently skipped: on PR #24 (list-secrets-command) the project
+// deliberately chose to fail outright over returning a partial list,
+// because a truncated list presented as complete is the same bug wearing a
+// smaller hat. That precedent is followed here.
 func (s *SecretService) List() ([]string, error) {
 	if err := s.connect(); err != nil {
 		return nil, err
 	}
-	collsVariant, err := s.service().GetProperty(ifaceService + ".Collections")
+	collsVariant, err := getPropertyTimeout(s.service(), ifaceService+".Collections")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Secret Service collections: %w", err)
 	}
@@ -277,21 +373,18 @@ func (s *SecretService) List() ([]string, error) {
 
 	var names []string
 	for _, c := range colls {
-		itemsVariant, err := s.object(secretsDest, c).GetProperty(ifaceCollection + ".Items")
+		itemsVariant, err := getPropertyTimeout(s.object(secretsDest, c), ifaceCollection+".Items")
 		if err != nil {
-			// Best-effort: a collection we can't currently enumerate (e.g. a
-			// transient race right after activation) shouldn't fail the
-			// whole listing.
-			continue
+			return nil, fmt.Errorf("failed to list items in collection %s: %w", c, err)
 		}
 		items, ok := itemsVariant.Value().([]dbus.ObjectPath)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("unexpected Items value type %T for collection %s", itemsVariant.Value(), c)
 		}
 		for _, it := range items {
 			attrs, err := s.itemAttributes(it)
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("failed to read attributes for item %s: %w", it, err)
 			}
 			if svc := attrs[attrService]; svc != "" {
 				names = append(names, svc)
@@ -331,7 +424,15 @@ func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, error) {
 	if item, ok := pickItem(newlyUnlocked); ok {
 		return item, nil
 	}
-	return "", &ErrNotFound{Service: service}
+	// The item is known to exist (searchItems returned it) and known to be
+	// locked (it was in the locked set, not the unlocked one) — but it did
+	// not come back in Unlock's result, meaning the unlock attempt did not
+	// succeed for it (e.g. the prompt was dismissed, or the provider
+	// refused). That is a materially different situation from "no such
+	// credential" and must not be reported as ErrNotFound.
+	return "", &ErrUnavailable{Reason: fmt.Sprintf(
+		"credential for '%s' exists but is locked, and the unlock attempt did not unlock it (the prompt may have been dismissed, or the keyring remains locked)", service,
+	)}
 }
 
 // pickItem returns the first candidate item, if any. Multiple items can
@@ -349,12 +450,14 @@ func pickItem(candidates []dbus.ObjectPath) (dbus.ObjectPath, bool) {
 // searchItems finds items across all collections tagged with
 // attrService == service, split into already-unlocked and locked.
 func (s *SecretService) searchItems(service string) (unlocked, locked []dbus.ObjectPath, err error) {
-	call := s.service().Call(ifaceService+".SearchItems", 0, map[string]string{attrService: service})
+	ctx, cancel := callCtx()
+	defer cancel()
+	call := s.service().CallWithContext(ctx, ifaceService+".SearchItems", 0, map[string]string{attrService: service})
 	if call.Err != nil {
 		return nil, nil, classifyBusError(call.Err)
 	}
 	if err := call.Store(&unlocked, &locked); err != nil {
-		return nil, nil, fmt.Errorf("unexpected reply from Secret Service SearchItems: %w", err)
+		return nil, nil, &ErrUnavailable{Reason: fmt.Sprintf("unexpected reply from Secret Service SearchItems: %v", err)}
 	}
 	return unlocked, locked, nil
 }
@@ -362,23 +465,36 @@ func (s *SecretService) searchItems(service string) (unlocked, locked []dbus.Obj
 // unlock unlocks the given items, driving any resulting prompt (e.g. a
 // desktop "unlock your keyring" dialog) to completion.
 func (s *SecretService) unlock(paths []dbus.ObjectPath) ([]dbus.ObjectPath, error) {
-	call := s.service().Call(ifaceService+".Unlock", 0, paths)
+	ctx, cancel := callCtx()
+	defer cancel()
+	call := s.service().CallWithContext(ctx, ifaceService+".Unlock", 0, paths)
 	if call.Err != nil {
 		return nil, classifyBusError(call.Err)
 	}
 	var unlocked []dbus.ObjectPath
 	var promptPath dbus.ObjectPath
 	if err := call.Store(&unlocked, &promptPath); err != nil {
-		return nil, fmt.Errorf("unexpected reply from Secret Service Unlock: %w", err)
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("unexpected reply from Secret Service Unlock: %v", err)}
 	}
 	if promptPath != rootPath {
 		result, err := s.prompt(promptPath)
 		if err != nil {
 			return nil, err
 		}
-		if arr, ok := result.Value().([]dbus.ObjectPath); ok {
-			unlocked = arr
+		arr, ok := result.Value().([]dbus.ObjectPath)
+		if !ok {
+			// A prompt the user completed is being reported as a success —
+			// silently keeping the pre-prompt `unlocked` value here would
+			// make a completed unlock look like it unlocked nothing, i.e.
+			// the credential would surface as ErrNotFound even though the
+			// user just unlocked it. This is also exactly how a
+			// protocol-shape mismatch against a non-GNOME provider would
+			// manifest, so it must not be silent either way.
+			return nil, &ErrUnavailable{Reason: fmt.Sprintf(
+				"unexpected Secret Service Prompt result type %T for Unlock (expected an array of object paths)", result.Value(),
+			)}
 		}
+		unlocked = arr
 	}
 	return unlocked, nil
 }
@@ -386,13 +502,13 @@ func (s *SecretService) unlock(paths []dbus.ObjectPath) ([]dbus.ObjectPath, erro
 // itemAttributes reads an item's Attributes property. This is public
 // metadata, readable without unlocking the item's secret value.
 func (s *SecretService) itemAttributes(item dbus.ObjectPath) (map[string]string, error) {
-	v, err := s.object(secretsDest, item).GetProperty(itemAttrsProp)
+	v, err := getPropertyTimeout(s.object(secretsDest, item), itemAttrsProp)
 	if err != nil {
 		return nil, err
 	}
 	attrs, ok := v.Value().(map[string]string)
 	if !ok {
-		return nil, fmt.Errorf("unexpected Attributes value type %T", v.Value())
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("unexpected Attributes value type %T", v.Value())}
 	}
 	return attrs, nil
 }
@@ -456,23 +572,37 @@ func dedupSorted(names []string) []string {
 // it can close over a plain *dbus.Conn without needing the objectFunc
 // indirection used elsewhere for testability — nothing about prompt-driving
 // is exercised by the unit tests, only by the live integration test.
+//
+// The whole function — including the Prompt() call itself, not just the
+// wait for its Completed signal — is bounded by promptWaitTimeout. Bounding
+// only the signal wait would leave a Prompt() call that blocks internally
+// (e.g. because a provider tries to display a GUI dialog and fails)
+// unbounded, defeating the timeout entirely.
 func runPromptOnConn(conn *dbus.Conn, path dbus.ObjectPath) (dbus.Variant, error) {
-	if err := conn.AddMatchSignal(
+	matchOpts := []dbus.MatchOption{
 		dbus.WithMatchObjectPath(path),
 		dbus.WithMatchInterface(ifacePrompt),
-	); err != nil {
+	}
+	if err := conn.AddMatchSignal(matchOpts...); err != nil {
 		return dbus.Variant{}, err
 	}
+	defer func() {
+		// Best-effort: this is cleanup, not a condition worth failing an
+		// otherwise-successful prompt over. Without it, one match rule
+		// leaks on the session bus per prompt driven.
+		_ = conn.RemoveMatchSignal(matchOpts...)
+	}()
 	ch := make(chan *dbus.Signal, 1)
 	conn.Signal(ch)
 	defer conn.RemoveSignal(ch)
 
-	if call := conn.Object(secretsDest, path).Call(ifacePrompt+".Prompt", 0, ""); call.Err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), promptWaitTimeout)
+	defer cancel()
+
+	if call := conn.Object(secretsDest, path).CallWithContext(ctx, ifacePrompt+".Prompt", 0, ""); call.Err != nil {
 		return dbus.Variant{}, call.Err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), promptWaitTimeout)
-	defer cancel()
 	select {
 	case sig, ok := <-ch:
 		if !ok {

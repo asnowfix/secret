@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
@@ -257,6 +258,145 @@ func TestSecretService_GetPassword_UnlocksLockedItem(t *testing.T) {
 	}
 }
 
+// TestSecretService_GetPassword_ReadFailureAfterResolveIsNotErrNotFound
+// covers CRITICAL 1 from the PR #29 review: resolveItem already found this
+// item, so a subsequent GetSecret failure is never "not found" — it must
+// not collapse to *ErrNotFound, because cmd/set.go treats *ErrNotFound as
+// "safe to overwrite without confirmation".
+func TestSecretService_GetPassword_ReadFailureAfterResolveIsNotErrNotFound(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: searchItemsCall([]dbus.ObjectPath{"/item/1"}, nil),
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		call: func(method string, args []interface{}) *dbus.Call {
+			if method != ifaceItem+".GetSecret" {
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+			return &dbus.Call{Err: dbus.Error{
+				Name: "org.freedesktop.DBus.Error.NoReply",
+				Body: []interface{}{"item re-locked between resolve and read"},
+			}}
+		},
+	})
+
+	s := newTestService(bus)
+	_, err := s.GetPassword("svc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var nf *ErrNotFound
+	if errors.As(err, &nf) {
+		t.Fatalf("a read failure on an item resolveItem already found must not be *ErrNotFound, got %v", err)
+	}
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected the wrapped error to be *ErrUnavailable, got %v (%T)", err, err)
+	}
+}
+
+// TestSecretService_GetUsername_ReadFailureAfterResolveIsNotErrNotFound is
+// the GetUsername counterpart of the above: itemAttributes failing after a
+// successful resolveItem must not be reported as "not found" either.
+func TestSecretService_GetUsername_ReadFailureAfterResolveIsNotErrNotFound(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: searchItemsCall([]dbus.ObjectPath{"/item/1"}, nil),
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.Variant{}, fmt.Errorf("transport fault")
+		},
+	})
+
+	s := newTestService(bus)
+	_, err := s.GetUsername("svc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var nf *ErrNotFound
+	if errors.As(err, &nf) {
+		t.Fatalf("a read failure on an item resolveItem already found must not be *ErrNotFound, got %v", err)
+	}
+}
+
+// TestSecretService_GetPassword_UnlockSucceedsButItemStillMissing covers the
+// resolveItem branch where Unlock returns without error but the target item
+// is absent from its result set (e.g. the prompt was dismissed). The item
+// is known to exist and known to be locked, so this must not be reported as
+// *ErrNotFound.
+func TestSecretService_GetPassword_UnlockSucceedsButItemStillMissing(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: func(method string, args []interface{}) *dbus.Call {
+			switch method {
+			case ifaceService + ".SearchItems":
+				return &dbus.Call{Body: []interface{}{[]dbus.ObjectPath(nil), []dbus.ObjectPath{"/item/1"}}}
+			case ifaceService + ".Unlock":
+				return &dbus.Call{Body: []interface{}{[]dbus.ObjectPath{}, rootPath}}
+			default:
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+		},
+	})
+
+	s := newTestService(bus)
+	_, err := s.GetPassword("svc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var nf *ErrNotFound
+	if errors.As(err, &nf) {
+		t.Fatalf("a known-to-exist, known-to-be-locked item must not report *ErrNotFound, got %v", err)
+	}
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected *ErrUnavailable, got %v (%T)", err, err)
+	}
+}
+
+// TestSecretService_Unlock_BadPromptResultType covers the case where the
+// Completed signal's result variant does not assert to []dbus.ObjectPath.
+// Silently keeping the pre-prompt (empty) unlocked set here would report a
+// prompt the user successfully completed as "not found".
+func TestSecretService_Unlock_BadPromptResultType(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: func(method string, args []interface{}) *dbus.Call {
+			switch method {
+			case ifaceService + ".SearchItems":
+				return &dbus.Call{Body: []interface{}{[]dbus.ObjectPath(nil), []dbus.ObjectPath{"/item/1"}}}
+			case ifaceService + ".Unlock":
+				return &dbus.Call{Body: []interface{}{[]dbus.ObjectPath(nil), dbus.ObjectPath("/prompt/1")}}
+			default:
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+		},
+	})
+
+	s := newTestService(bus)
+	s.prompt = func(dbus.ObjectPath) (dbus.Variant, error) {
+		// Wrong shape: a real Secret Service Unlock prompt's Completed
+		// result is []dbus.ObjectPath, not a bool.
+		return dbus.MakeVariant(true), nil
+	}
+
+	_, err := s.GetPassword("svc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected *ErrUnavailable for an unrecognized prompt result, got %v (%T)", err, err)
+	}
+}
+
 func TestSecretService_Add(t *testing.T) {
 	bus := newFakeBus(t)
 	var gotProps map[string]dbus.Variant
@@ -370,6 +510,40 @@ func TestSecretService_Delete(t *testing.T) {
 	}
 }
 
+// TestSecretService_Delete_LockedItemFailureHintsUnlock covers the
+// Delete/locked-item mismatch from the PR #29 review: Delete does not
+// unlock locked items first, so if a provider's Item.Delete call fails on
+// one, the error must call out that the item is locked rather than
+// surfacing a generic "backend down" message.
+func TestSecretService_Delete_LockedItemFailureHintsUnlock(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: searchItemsCall(nil, []dbus.ObjectPath{"/item/1"}),
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		call: func(method string, args []interface{}) *dbus.Call {
+			if method != ifaceItem+".Delete" {
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+			return &dbus.Call{Err: dbus.Error{
+				Name: "org.freedesktop.DBus.Error.AccessDenied",
+				Body: []interface{}{"item is locked"},
+			}}
+		},
+	})
+
+	s := newTestService(bus)
+	err := s.Delete("svc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("expected the error to explain that the item is locked, got %v", err)
+	}
+}
+
 func TestSecretService_Delete_NotFound(t *testing.T) {
 	bus := newFakeBus(t)
 	bus.register(&fakeObject{
@@ -442,6 +616,86 @@ func TestSecretService_List(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+// TestSecretService_List_CollectionPropertyErrorFailsWholeCall covers
+// CRITICAL 3 from the PR #29 review: on PR #24 the project deliberately
+// chose to fail List() outright over returning a partial list, on the
+// grounds that a truncated list presented as complete is the same bug
+// wearing a smaller hat. A collection whose Items property errors must
+// fail the whole call, not be silently skipped.
+func TestSecretService_List_CollectionPropertyErrorFailsWholeCall(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		prop: func(name string) (dbus.Variant, error) {
+			if name != ifaceService+".Collections" {
+				return dbus.Variant{}, fmt.Errorf("unexpected property %s", name)
+			}
+			return dbus.MakeVariant([]dbus.ObjectPath{"/collection/login", "/collection/broken"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/collection/login",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{"/item/1"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "alpha", attrUsername: "a"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/collection/broken",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.Variant{}, fmt.Errorf("collection temporarily unreadable (e.g. a race right after activation)")
+		},
+	})
+
+	s := newTestService(bus)
+	got, err := s.List()
+	if err == nil {
+		t.Fatalf("expected List to fail when a collection cannot be enumerated, got %v (no error)", got)
+	}
+}
+
+// TestSecretService_List_ItemAttributesErrorFailsWholeCall is the
+// item-level counterpart: a single item's Attributes property erroring
+// must also fail the whole call rather than being skipped.
+func TestSecretService_List_ItemAttributesErrorFailsWholeCall(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{"/collection/login"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/collection/login",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{"/item/1", "/item/2"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "alpha"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/2",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.Variant{}, fmt.Errorf("attribute read failed")
+		},
+	})
+
+	s := newTestService(bus)
+	got, err := s.List()
+	if err == nil {
+		t.Fatalf("expected List to fail when an item's attributes can't be read, got %v (no error)", got)
 	}
 }
 
