@@ -39,7 +39,25 @@ jobs:
             # activation of org.freedesktop.secrets has necessarily settled;
             # calling into it immediately can otherwise race and see only
             # the in-memory "session" collection, not the persistent
-            # "login" one. A short, fixed sleep avoids that flake.
-            sleep 1
+            # "login" one. Poll for org.freedesktop.secrets bus-name
+            # ownership instead of a fixed sleep: this is the only step
+            # that ever exercises the Secret Service backend against a real
+            # daemon (nobody on this project has a Linux desktop to debug a
+            # flake here interactively), so bound on the actual readiness
+            # condition rather than a guessed delay.
+            ready=0
+            for i in $(seq 1 50); do
+              if dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+                  --print-reply /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+                  string:org.freedesktop.secrets 2>/dev/null | grep -q "boolean true"; then
+                ready=1
+                break
+              fi
+              sleep 0.1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "org.freedesktop.secrets never appeared on the session bus after 5s" >&2
+              exit 1
+            fi
             SECRET_LIVE_DBUS_TEST=1 go test ./backend/... -run TestSecretServiceLive -v
           '
