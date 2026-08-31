@@ -4,6 +4,7 @@ package backend
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,7 +40,10 @@ var acctRegexp = regexp.MustCompile(`^\s+"acct"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-
 func (k *Keychain) GetUsername(service string) (string, error) {
 	output, err := k.findPassword(service, false)
 	if err != nil {
-		return "", &ErrNotFound{Service: service}
+		if errors.Is(err, errItemNotFound) {
+			return "", &ErrNotFound{Service: service}
+		}
+		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: %v", service, err)}
 	}
 
 	for _, line := range strings.Split(output, "\n") {
@@ -61,7 +65,10 @@ func (k *Keychain) GetUsername(service string) (string, error) {
 func (k *Keychain) GetPassword(service string) (string, error) {
 	output, err := k.findPassword(service, true)
 	if err != nil {
-		return "", &ErrNotFound{Service: service}
+		if errors.Is(err, errItemNotFound) {
+			return "", &ErrNotFound{Service: service}
+		}
+		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: %v", service, err)}
 	}
 	return strings.TrimRight(output, "\n"), nil
 }
@@ -103,6 +110,49 @@ func (k *Keychain) Edit() error {
 	return exec.Command("open", "-b", "com.apple.keychainaccess").Start()
 }
 
+// errItemNotFound is findPassword's internal sentinel for a definitive "no
+// such item", i.e. /usr/bin/security exiting with secItemNotFoundExitCode.
+// Any other failure (locked keychain, missing binary, unexpected exit code)
+// is returned as its own error instead, so GetPassword/GetUsername can tell
+// "absent" apart from "could not determine" rather than collapsing both into
+// *ErrNotFound.
+var errItemNotFound = errors.New("keychain item not found")
+
+// secItemNotFoundExitCode is the Unix exit code /usr/bin/security uses to
+// report errSecItemNotFound (OSStatus -25300). An OSStatus becomes a process
+// exit code via its low byte (-25300 & 0xFF == 44); verified by hand against
+// a scratch keychain (see PR description) rather than assumed.
+const secItemNotFoundExitCode = 44
+
+// runSecurityFind runs /usr/bin/security with the given arguments and
+// classifies the result: success returns stdout; a definitive "item not
+// found" exit returns errItemNotFound; anything else (locked keychain,
+// missing/non-executable binary, unexpected exit code) returns an error
+// carrying whatever diagnostic security produced, instead of being folded
+// into "not found".
+func runSecurityFind(args ...string) (string, error) {
+	cmd := exec.Command("/usr/bin/security", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == secItemNotFoundExitCode {
+			return "", errItemNotFound
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			// security sometimes exits non-zero with no stderr at all — e.g.
+			// a locked keychain queried non-interactively exits 152 with no
+			// message. Fall back to the process error so the caller still
+			// gets a real diagnostic instead of silence.
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("security %s: %s", args[0], msg)
+	}
+	return stdout.String(), nil
+}
+
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {
 	var flag string
 	if passwordOnly {
@@ -111,24 +161,19 @@ func (k *Keychain) findPassword(service string, passwordOnly bool) (string, erro
 		flag = "-g"
 	}
 
-	// Try generic password first
-	cmd := exec.Command("/usr/bin/security", "find-generic-password", flag, "-s", service, k.keychainPath)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stdout
-	if err := cmd.Run(); err == nil {
-		return stdout.String(), nil
+	// Try generic password first. A real failure here (not a "not found")
+	// means we cannot determine whether the item exists at all, so return
+	// immediately rather than masking it with an internet-password attempt.
+	out, err := runSecurityFind("find-generic-password", flag, "-s", service, k.keychainPath)
+	if err == nil {
+		return out, nil
 	}
-
-	// Fall back to internet password
-	stdout.Reset()
-	cmd = exec.Command("/usr/bin/security", "find-internet-password", flag, "-s", service, k.keychainPath)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stdout
-	if err := cmd.Run(); err != nil {
+	if !errors.Is(err, errItemNotFound) {
 		return "", err
 	}
-	return stdout.String(), nil
+
+	// Fall back to internet password.
+	return runSecurityFind("find-internet-password", flag, "-s", service, k.keychainPath)
 }
 
 func hexDecode(s string) (string, error) {
