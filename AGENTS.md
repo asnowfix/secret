@@ -24,7 +24,7 @@ This is a Cobra+Viper CLI (`main.go` → `cmd/` → `backend/`) that abstracts p
 
 - **Platform selection is compile-time**: `cmd/backend_darwin.go`, `cmd/backend_linux.go`, `cmd/backend_windows.go` each provide `selectBackend()` gated by `//go:build` tags. New backends for a specific OS go in a file with the matching build tag.
 - **The macOS Keychain backend shells out to `/usr/bin/security`** rather than using cgo. This preserves ACL behavior (the `-T /usr/bin/security` flag grants non-interactive access).
-- **Backend interface** (`backend/backend.go`): all backends implement `IsAvailable`, `GetUsername`, `GetPassword`, `Add`, `Delete`, `Edit`. Return `*ErrNotFound` or `*ErrUnavailable` for typed error handling.
+- **Backend interface** (`backend/backend.go`): all backends implement `IsAvailable`, `GetUsername`, `GetPassword`, `Add`, `Delete`, `Edit`, `List`. Return `*ErrNotFound` or `*ErrUnavailable` for typed error handling; `List` may additionally return `*ErrNotSupported` for backends that cannot enumerate at all.
 - **Runtime availability check**: `PersistentPreRunE` in the root command calls `b.IsAvailable()` before any subcommand runs (guards against locked keychains, missing daemons, etc.).
 
 ## Adding a New Backend

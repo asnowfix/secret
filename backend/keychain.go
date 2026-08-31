@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -82,7 +81,10 @@ func (k *Keychain) Add(service, account, password string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to add secret for '%s': %s", service, strings.TrimSpace(stderr.String()))
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("failed to add secret for '%s': %s", service, msg)
+		}
+		return fmt.Errorf("failed to add secret for '%s': %w", service, err)
 	}
 	return nil
 }
@@ -115,7 +117,10 @@ func (k *Keychain) List() ([]string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to list secrets: %s", strings.TrimSpace(stderr.String()))
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %s", msg)}
+		}
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %s", err)}
 	}
 	return parseKeychainDumpServices(stdout.String()), nil
 }
@@ -124,8 +129,7 @@ func (k *Keychain) List() ([]string, error) {
 // names from `security dump-keychain` output, matching "svce" (generic
 // password) and "srvr" (internet password) attribute lines.
 func parseKeychainDumpServices(dump string) []string {
-	seen := make(map[string]bool)
-	var services []string
+	var names []string
 	for _, line := range strings.Split(dump, "\n") {
 		m := svceRegexp.FindStringSubmatch(line)
 		if m == nil {
@@ -146,13 +150,9 @@ func parseKeychainDumpServices(dump string) []string {
 			continue
 		}
 
-		if !seen[name] {
-			seen[name] = true
-			services = append(services, name)
-		}
+		names = append(names, name)
 	}
-	sort.Strings(services)
-	return services
+	return DedupeSortServices(names)
 }
 
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {

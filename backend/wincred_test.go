@@ -33,6 +33,24 @@ func TestFilterGenericTargetNames(t *testing.T) {
 	}
 }
 
+// TestFilterGenericTargetNames_Dedup guards the assumption the review
+// flagged as untested: CredEnumerateW is not documented to guarantee unique
+// TargetName values per credential type, so filterGenericTargetNames must
+// dedupe like the other backends' List() implementations do.
+func TestFilterGenericTargetNames_Dedup(t *testing.T) {
+	creds := []*nativeCredential{
+		{Type: credTypeGeneric, TargetName: mustUTF16Ptr(t, "github.com")},
+		{Type: credTypeGeneric, TargetName: mustUTF16Ptr(t, "github.com")},
+		{Type: credTypeGeneric, TargetName: mustUTF16Ptr(t, "example.com")},
+	}
+
+	got := filterGenericTargetNames(creds)
+	want := []string{"example.com", "github.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("filterGenericTargetNames() = %v, want %v", got, want)
+	}
+}
+
 func TestFilterGenericTargetNames_Empty(t *testing.T) {
 	got := filterGenericTargetNames(nil)
 	if len(got) != 0 {

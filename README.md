@@ -9,12 +9,12 @@ Provide a single `secret` binary that works identically across macOS, Linux, and
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   CLI (Cobra)                    │
+┌───────────────────────────────────────────────────────┐
+│                      CLI (Cobra)                      │
 │  secret login|password|add|delete|edit|list <service> │
-└────────────────────────┬────────────────────────┘
-                         │
-                         ▼
+└───────────────────────────┬───────────────────────────┘
+                            │
+                            ▼
 ┌─────────────────────────────────────────────────┐
 │              backend.Backend interface           │
 │  IsAvailable · GetUsername · GetPassword         │

@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
-	"sort"
 	"syscall"
 	"unsafe"
 
@@ -167,7 +166,7 @@ func (c *CredentialManager) List() ([]string, error) {
 		if e == windows.ERROR_NOT_FOUND {
 			return []string{}, nil
 		}
-		return nil, fmt.Errorf("failed to enumerate credentials: %w", e)
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to enumerate credentials: %s", e)}
 	}
 	defer procCredFree.Call(uintptr(unsafe.Pointer(pCreds)))
 
@@ -176,17 +175,16 @@ func (c *CredentialManager) List() ([]string, error) {
 }
 
 // filterGenericTargetNames extracts the target (service) names of
-// CRED_TYPE_GENERIC credentials, sorted.
+// CRED_TYPE_GENERIC credentials, deduplicated and sorted.
 func filterGenericTargetNames(creds []*nativeCredential) []string {
-	services := make([]string, 0, len(creds))
+	names := make([]string, 0, len(creds))
 	for _, cred := range creds {
 		if cred.Type != credTypeGeneric || cred.TargetName == nil {
 			continue
 		}
-		services = append(services, windows.UTF16PtrToString(cred.TargetName))
+		names = append(names, windows.UTF16PtrToString(cred.TargetName))
 	}
-	sort.Strings(services)
-	return services
+	return DedupeSortServices(names)
 }
 
 func credReadW(service string) (*nativeCredential, error) {
