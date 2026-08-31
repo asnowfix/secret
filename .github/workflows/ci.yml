@@ -21,3 +21,25 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
+      # The Linux Secret Service backend (backend/libsecret.go) needs a real
+      # D-Bus session with a Secret Service provider on it. There is no
+      # Linux desktop available to verify this by hand, so this headless
+      # recipe — dbus-run-session plus an unlocked gnome-keyring-daemon — is
+      # the only thing that ever exercises it against a real daemon. See
+      # backend/libsecret_live_test.go.
+      - name: Secret Service live test (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dbus-x11 gnome-keyring
+          dbus-run-session -- bash -c '
+            eval $(printf "\n" | gnome-keyring-daemon --unlock --daemonize --components=secrets)
+            export GNOME_KEYRING_CONTROL
+            # gnome-keyring-daemon --daemonize backgrounds before the D-Bus
+            # activation of org.freedesktop.secrets has necessarily settled;
+            # calling into it immediately can otherwise race and see only
+            # the in-memory "session" collection, not the persistent
+            # "login" one. A short, fixed sleep avoids that flake.
+            sleep 1
+            SECRET_LIVE_DBUS_TEST=1 go test ./backend/... -run TestSecretServiceLive -v
+          '
