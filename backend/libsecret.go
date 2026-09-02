@@ -62,10 +62,63 @@ const (
 
 // Attribute keys used to tag every item this backend creates. "username" is
 // left empty (but still present) for services stored without an account.
+//
+// attrSchema follows the Secret Service/libsecret convention (the "xdg:schema"
+// attribute set automatically by libsecret's C API alongside a SecretSchema
+// name) for namespacing which application owns an item. Without it, every
+// lookup here matched purely on the generic "service" attribute — a subset
+// match against *every* item in the collection, including ones written by a
+// completely unrelated local application that happens to use the same
+// "service"/"username" convention (Python's `keyring` library's
+// SecretService backend is a concrete, common example). That let
+// GetPassword/List disclose, and Delete/Add silently clobber, another app's
+// credential. See searchItems, filterOwnItems, and isOwnItem below for how
+// this is enforced on every read/write/delete/list path.
 const (
 	attrService  = "service"
 	attrUsername = "username"
+	attrSchema   = "xdg:schema"
 )
+
+// appSchema is this backend's own xdg:schema value, stamped on every item it
+// creates (see Add) and used to recognize its own items on every search
+// (see isOwnItem). It follows the reverse-DNS convention libsecret schema
+// names use.
+const appSchema = "org.asnowfix.secret.Password"
+
+// isOwnItem reports whether an item's attributes identify it as one this
+// backend created, or one it should still treat as its own for backward
+// compatibility.
+//
+// Migration decision: items written by pre-fix versions of this exact
+// backend have a "service" attribute but no "xdg:schema" attribute at all
+// (this fix is what starts stamping it). Requiring an exact appSchema match
+// would make every credential a user stored before upgrading invisible to
+// GetPassword/GetUsername/List, and silently undeletable by Delete —
+// dropping support for existing stored credentials on a routine upgrade,
+// which is its own real (and worse) problem than the one this fix closes.
+// So an item is treated as "ours" if its xdg:schema is either exactly
+// appSchema, or absent entirely.
+//
+// This intentionally reintroduces a narrower version of the original
+// collision risk, scoped to items with no xdg:schema attribute at all:
+// an unrelated application that also never sets xdg:schema (i.e. one that
+// talks to Secret Service directly rather than through libsecret's schema
+// API, which stamps xdg:schema automatically) can still collide on
+// "service" alone, exactly as before this fix. What this fix does close is
+// the collision against any *compliant* application that does tag its
+// items with its own schema (the common case for anything built on
+// libsecret, GNOME's SecretSchema API, etc.) — those are now unambiguously
+// recognized as foreign and excluded, never matched, read, listed, or
+// deleted. Closing the narrower remaining gap would require either a
+// one-time migration that rewrites every pre-fix item to add attrSchema, or
+// dropping backward compatibility entirely; neither was judged worth the
+// implementation cost given how narrow (and no worse than the pre-fix
+// status quo) the residual case is.
+func isOwnItem(attrs map[string]string) bool {
+	schema := attrs[attrSchema]
+	return schema == "" || schema == appSchema
+}
 
 // promptWaitTimeout bounds how long we wait for a user to respond to a
 // Secret Service unlock/create prompt (e.g. a GUI "unlock your keyring"
@@ -214,19 +267,12 @@ func (s *SecretService) GetUsername(service string) (string, error) {
 	if err := s.connect(); err != nil {
 		return "", err
 	}
-	item, err := s.resolveItem(service)
+	// resolveItem already has to read the item's attributes to decide
+	// ownership (see isOwnItem), so it returns them here for reuse instead
+	// of paying for a second GetProperty round trip.
+	_, attrs, err := s.resolveItem(service)
 	if err != nil {
 		return "", err
-	}
-	attrs, err := s.itemAttributes(item)
-	if err != nil {
-		// resolveItem already found this item and unlocked it if needed, so
-		// "not found" would be a lie here: the item demonstrably exists.
-		// This is a read failure (transport fault, item re-locked between
-		// resolve and read, etc.) — surface it as such rather than as
-		// ErrNotFound, which callers (notably cmd/set.go's overwrite check)
-		// treat as "safe to proceed without confirmation".
-		return "", fmt.Errorf("failed to read username for '%s': %w", service, err)
 	}
 	return attrs[attrUsername], nil
 }
@@ -236,7 +282,7 @@ func (s *SecretService) GetPassword(service string) (string, error) {
 	if err := s.connect(); err != nil {
 		return "", err
 	}
-	item, err := s.resolveItem(service)
+	item, _, err := s.resolveItem(service)
 	if err != nil {
 		return "", err
 	}
@@ -272,6 +318,7 @@ func (s *SecretService) Add(service, account, password string) error {
 		itemAttrsProp: dbus.MakeVariant(map[string]string{
 			attrService:  service,
 			attrUsername: account,
+			attrSchema:   appSchema,
 		}),
 	}
 	sec := secretValue{
@@ -386,6 +433,12 @@ func (s *SecretService) List() ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to read attributes for item %s: %w", it, err)
 			}
+			if !isOwnItem(attrs) {
+				// A different local application's item that happens to share
+				// the "service" attribute convention (see isOwnItem) — must
+				// not be disclosed via List any more than via GetPassword.
+				continue
+			}
 			if svc := attrs[attrService]; svc != "" {
 				names = append(names, svc)
 			}
@@ -404,25 +457,37 @@ func (s *SecretService) Edit() error {
 	return fmt.Errorf("no native secret-manager UI is available on Linux; inspect or edit items directly with a tool like 'secret-tool' or your desktop's keyring app (e.g. Seahorse, KWalletManager)")
 }
 
-// resolveItem finds a single item tagged with attrService == service,
-// unlocking it first if it exists but is locked.
-func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, error) {
+// resolveItem finds a single item tagged with attrService == service that
+// this backend recognizes as its own (see isOwnItem — searchItems already
+// filters on this), unlocking it first if it exists but is locked. It
+// returns the resolved item's attributes alongside its path so callers that
+// need them (GetUsername, GetPassword's caller-visible username) don't pay
+// for a second GetProperty round trip.
+func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, map[string]string, error) {
 	unlocked, locked, err := s.searchItems(service)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if item, ok := pickItem(unlocked); ok {
-		return item, nil
+		attrs, err := s.itemAttributes(item)
+		if err != nil {
+			return "", nil, err
+		}
+		return item, attrs, nil
 	}
 	if len(locked) == 0 {
-		return "", &ErrNotFound{Service: service}
+		return "", nil, &ErrNotFound{Service: service}
 	}
 	newlyUnlocked, err := s.unlock(locked)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if item, ok := pickItem(newlyUnlocked); ok {
-		return item, nil
+		attrs, err := s.itemAttributes(item)
+		if err != nil {
+			return "", nil, err
+		}
+		return item, attrs, nil
 	}
 	// The item is known to exist (searchItems returned it) and known to be
 	// locked (it was in the locked set, not the unlocked one) — but it did
@@ -430,7 +495,7 @@ func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, error) {
 	// succeed for it (e.g. the prompt was dismissed, or the provider
 	// refused). That is a materially different situation from "no such
 	// credential" and must not be reported as ErrNotFound.
-	return "", &ErrUnavailable{Reason: fmt.Sprintf(
+	return "", nil, &ErrUnavailable{Reason: fmt.Sprintf(
 		"credential for '%s' exists but is locked, and the unlock attempt did not unlock it (the prompt may have been dismissed, or the keyring remains locked)", service,
 	)}
 }
@@ -448,7 +513,13 @@ func pickItem(candidates []dbus.ObjectPath) (dbus.ObjectPath, bool) {
 }
 
 // searchItems finds items across all collections tagged with
-// attrService == service, split into already-unlocked and locked.
+// attrService == service, split into already-unlocked and locked, filtered
+// down to the ones this backend recognizes as its own (see isOwnItem). A
+// foreign item — one written by a different local application that happens
+// to share the "service"/"username" attribute convention — is dropped here,
+// before any caller (resolveItem, Delete) ever sees its path, so it behaves
+// as if SearchItems had never returned it in the first place rather than
+// merely being excluded after the fact.
 func (s *SecretService) searchItems(service string) (unlocked, locked []dbus.ObjectPath, err error) {
 	ctx, cancel := callCtx()
 	defer cancel()
@@ -456,10 +527,36 @@ func (s *SecretService) searchItems(service string) (unlocked, locked []dbus.Obj
 	if call.Err != nil {
 		return nil, nil, classifyBusError(call.Err)
 	}
-	if err := call.Store(&unlocked, &locked); err != nil {
+	var rawUnlocked, rawLocked []dbus.ObjectPath
+	if err := call.Store(&rawUnlocked, &rawLocked); err != nil {
 		return nil, nil, &ErrUnavailable{Reason: fmt.Sprintf("unexpected reply from Secret Service SearchItems: %v", err)}
 	}
+	if unlocked, err = s.filterOwnItems(rawUnlocked); err != nil {
+		return nil, nil, err
+	}
+	if locked, err = s.filterOwnItems(rawLocked); err != nil {
+		return nil, nil, err
+	}
 	return unlocked, locked, nil
+}
+
+// filterOwnItems reads each candidate item's attributes (public metadata,
+// readable without unlocking — see itemAttributes) and returns only the
+// ones isOwnItem recognizes as this backend's own. Attributes are read
+// unconditionally, including for locked items, on the same "public metadata"
+// grounds List already relies on.
+func (s *SecretService) filterOwnItems(items []dbus.ObjectPath) ([]dbus.ObjectPath, error) {
+	var owned []dbus.ObjectPath
+	for _, it := range items {
+		attrs, err := s.itemAttributes(it)
+		if err != nil {
+			return nil, err
+		}
+		if isOwnItem(attrs) {
+			owned = append(owned, it)
+		}
+	}
+	return owned, nil
 }
 
 // unlock unlocks the given items, driving any resulting prompt (e.g. a

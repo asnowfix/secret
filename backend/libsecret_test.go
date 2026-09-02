@@ -178,6 +178,11 @@ func TestSecretService_GetPassword(t *testing.T) {
 	})
 	bus.register(&fakeObject{
 		path: "/item/1",
+		// resolveItem now has to read Attributes to confirm ownership (see
+		// isOwnItem) before GetPassword ever calls GetSecret.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc", attrUsername: "alice"}), nil
+		},
 		call: func(method string, args []interface{}) *dbus.Call {
 			if method != ifaceItem+".GetSecret" {
 				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
@@ -219,6 +224,39 @@ func TestSecretService_GetPassword_NotFound(t *testing.T) {
 	}
 }
 
+// TestSecretService_GetPassword_ForeignSchemaItemIsNotFound is the HIGH
+// severity fix from the PR #29 security review: an item that matches on the
+// "service" attribute but was written by a different local application (a
+// different xdg:schema) must never be disclosed via GetPassword. It must
+// behave exactly as if SearchItems had never returned it — i.e. *ErrNotFound
+// — not merely "found but rejected" with some other error.
+func TestSecretService_GetPassword_ForeignSchemaItemIsNotFound(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: searchItemsCall([]dbus.ObjectPath{"/item/1"}, nil),
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{
+				attrService: "svc",
+				attrSchema:  "com.example.other.Schema",
+			}), nil
+		},
+		call: func(method string, args []interface{}) *dbus.Call {
+			return &dbus.Call{Err: fmt.Errorf("foreign item /item/1 must never be read, got %s", method)}
+		},
+	})
+
+	s := newTestService(bus)
+	_, err := s.GetPassword("svc")
+	var nf *ErrNotFound
+	if !errors.As(err, &nf) {
+		t.Fatalf("expected *ErrNotFound for a foreign-schema item, got %v (%T)", err, err)
+	}
+}
+
 func TestSecretService_GetPassword_UnlocksLockedItem(t *testing.T) {
 	bus := newFakeBus(t)
 	bus.register(&fakeObject{
@@ -240,6 +278,11 @@ func TestSecretService_GetPassword_UnlocksLockedItem(t *testing.T) {
 	})
 	bus.register(&fakeObject{
 		path: "/item/1",
+		// filterOwnItems reads Attributes on the locked candidate too (see
+		// searchItems), before it ever gets to Unlock.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+		},
 		call: func(method string, args []interface{}) *dbus.Call {
 			if method != ifaceItem+".GetSecret" {
 				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
@@ -271,6 +314,11 @@ func TestSecretService_GetPassword_ReadFailureAfterResolveIsNotErrNotFound(t *te
 	})
 	bus.register(&fakeObject{
 		path: "/item/1",
+		// resolveItem reads Attributes to confirm ownership before returning
+		// this item, so this must succeed for the test to reach GetSecret.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+		},
 		call: func(method string, args []interface{}) *dbus.Call {
 			if method != ifaceItem+".GetSecret" {
 				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
@@ -344,6 +392,14 @@ func TestSecretService_GetPassword_UnlockSucceedsButItemStillMissing(t *testing.
 			}
 		},
 	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		// filterOwnItems (called from searchItems) reads Attributes on the
+		// locked candidate to confirm ownership before Unlock is ever tried.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+		},
+	})
 
 	s := newTestService(bus)
 	_, err := s.GetPassword("svc")
@@ -377,6 +433,14 @@ func TestSecretService_Unlock_BadPromptResultType(t *testing.T) {
 			default:
 				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
 			}
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		// filterOwnItems (called from searchItems) reads Attributes on the
+		// locked candidate to confirm ownership before Unlock is ever tried.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
 		},
 	})
 
@@ -435,6 +499,13 @@ func TestSecretService_Add(t *testing.T) {
 	attrs := gotProps[itemAttrsProp].Value().(map[string]string)
 	if attrs[attrService] != "svc" || attrs[attrUsername] != "alice" {
 		t.Fatalf("unexpected attributes: %v", attrs)
+	}
+	// CRITICAL (PR #29 security review): every item this backend creates
+	// must be stamped with its own xdg:schema so later reads can tell it
+	// apart from another local application's item that happens to share the
+	// "service"/"username" attribute convention (see isOwnItem).
+	if attrs[attrSchema] != appSchema {
+		t.Fatalf("got xdg:schema %q, want %q", attrs[attrSchema], appSchema)
 	}
 }
 
@@ -498,8 +569,13 @@ func TestSecretService_Delete(t *testing.T) {
 			return &dbus.Call{Body: []interface{}{rootPath}}
 		}
 	}
-	bus.register(&fakeObject{path: "/item/1", call: deleteHandler("/item/1")})
-	bus.register(&fakeObject{path: "/item/2", call: deleteHandler("/item/2")})
+	// searchItems (via filterOwnItems) reads Attributes on every candidate,
+	// locked or not, to confirm ownership before Delete ever touches it.
+	ownAttrs := func(string) (dbus.Variant, error) {
+		return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+	}
+	bus.register(&fakeObject{path: "/item/1", call: deleteHandler("/item/1"), prop: ownAttrs})
+	bus.register(&fakeObject{path: "/item/2", call: deleteHandler("/item/2"), prop: ownAttrs})
 
 	s := newTestService(bus)
 	if err := s.Delete("svc"); err != nil {
@@ -507,6 +583,52 @@ func TestSecretService_Delete(t *testing.T) {
 	}
 	if len(deletedPaths) != 2 {
 		t.Fatalf("expected both matching items deleted, got %v", deletedPaths)
+	}
+}
+
+// TestSecretService_Delete_ExcludesForeignSchemaItem covers the Delete side
+// of the PR #29 security review: an item that shares the "service" attribute
+// with what's being deleted, but carries a different application's
+// xdg:schema, must never be touched — Delete must behave as if that item did
+// not exist at all, not merely skip it after finding it.
+func TestSecretService_Delete_ExcludesForeignSchemaItem(t *testing.T) {
+	var deletedPaths []dbus.ObjectPath
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		call: searchItemsCall([]dbus.ObjectPath{"/item/1", "/item/2"}, nil),
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+		},
+		call: func(method string, args []interface{}) *dbus.Call {
+			if method != ifaceItem+".Delete" {
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+			deletedPaths = append(deletedPaths, "/item/1")
+			return &dbus.Call{Body: []interface{}{rootPath}}
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/2",
+		// A foreign application's item that happens to share the "service"
+		// attribute value, but tags itself with its own xdg:schema.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc", attrSchema: "com.example.other.Schema"}), nil
+		},
+		call: func(method string, args []interface{}) *dbus.Call {
+			return &dbus.Call{Err: fmt.Errorf("foreign item /item/2 must never be called, got %s", method)}
+		},
+	})
+
+	s := newTestService(bus)
+	if err := s.Delete("svc"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(deletedPaths) != 1 || deletedPaths[0] != "/item/1" {
+		t.Fatalf("expected only /item/1 to be deleted, got %v", deletedPaths)
 	}
 }
 
@@ -523,6 +645,11 @@ func TestSecretService_Delete_LockedItemFailureHintsUnlock(t *testing.T) {
 	})
 	bus.register(&fakeObject{
 		path: "/item/1",
+		// filterOwnItems reads Attributes on the locked candidate to confirm
+		// ownership before Delete ever calls Item.Delete on it.
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
+		},
 		call: func(method string, args []interface{}) *dbus.Call {
 			if method != ifaceItem+".Delete" {
 				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
@@ -579,7 +706,7 @@ func TestSecretService_List(t *testing.T) {
 	bus.register(&fakeObject{
 		path: "/collection/session",
 		prop: func(string) (dbus.Variant, error) {
-			return dbus.MakeVariant([]dbus.ObjectPath{"/item/3"}), nil
+			return dbus.MakeVariant([]dbus.ObjectPath{"/item/3", "/item/4"}), nil
 		},
 	})
 	bus.register(&fakeObject{
@@ -597,9 +724,22 @@ func TestSecretService_List(t *testing.T) {
 	bus.register(&fakeObject{
 		path: "/item/3",
 		prop: func(string) (dbus.Variant, error) {
-			// Duplicate service name in a different collection, and an item
-			// with no attributes at all (e.g. created by an unrelated app).
+			// Duplicate service name ("alpha") in a different collection, with
+			// no xdg:schema at all — a legacy item this backend itself wrote
+			// before the fix, still recognized as "own" by isOwnItem, so this
+			// exercises dedupSorted collapsing it with /item/2's "alpha".
 			return dbus.MakeVariant(map[string]string{attrService: "alpha"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/4",
+		prop: func(string) (dbus.Variant, error) {
+			// CRITICAL (PR #29 security review): an unrelated local
+			// application's item that happens to use the same "service"
+			// attribute convention, but tags itself with its own xdg:schema.
+			// isOwnItem must recognize this as foreign, and List must exclude
+			// it entirely rather than disclose it.
+			return dbus.MakeVariant(map[string]string{attrService: "gamma", attrSchema: "com.example.other.Schema"}), nil
 		},
 	})
 
@@ -615,6 +755,11 @@ func TestSecretService_List(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	for _, n := range got {
+		if n == "gamma" {
+			t.Fatalf("expected the foreign-schema item's service (gamma) to be excluded, got %v", got)
 		}
 	}
 }
@@ -734,6 +879,30 @@ func TestBuildItemLabel(t *testing.T) {
 	}
 	if got := buildItemLabel("svc", "alice"); got != "svc (alice)" {
 		t.Fatalf("got %q, want svc (alice)", got)
+	}
+}
+
+// TestIsOwnItem covers the three cases isOwnItem's migration decision (see
+// its doc comment) is built around: an exact appSchema match, a missing
+// xdg:schema attribute (a legacy item from before this fix), and a
+// different application's schema.
+func TestIsOwnItem(t *testing.T) {
+	cases := []struct {
+		name  string
+		attrs map[string]string
+		want  bool
+	}{
+		{"exact schema match", map[string]string{attrSchema: appSchema}, true},
+		{"schema attribute absent (legacy item)", map[string]string{attrService: "svc"}, true},
+		{"schema attribute present but empty", map[string]string{attrSchema: ""}, true},
+		{"different application's schema", map[string]string{attrSchema: "com.example.other.Schema"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isOwnItem(c.attrs); got != c.want {
+				t.Fatalf("isOwnItem(%v) = %v, want %v", c.attrs, got, c.want)
+			}
+		})
 	}
 }
 
