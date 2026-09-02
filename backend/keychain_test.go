@@ -4,10 +4,47 @@ package backend
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// withStandInSecurity points securityBinary at a stand-in executable and
+// shrinks securityCommandTimeout to timeout for the duration of the test,
+// restoring both package vars afterwards.
+func withStandInSecurity(t *testing.T, binary string, timeout time.Duration) {
+	t.Helper()
+	origBinary, origTimeout := securityBinary, securityCommandTimeout
+	t.Cleanup(func() {
+		securityBinary = origBinary
+		securityCommandTimeout = origTimeout
+	})
+	securityBinary = binary
+	securityCommandTimeout = timeout
+}
+
+// hangingSecurityScript writes a stand-in for /usr/bin/security that never
+// exits on its own and returns its path. It stands in for what actually
+// happens against a real locked keychain with no agent to answer: the real
+// security binary does not hang because it is blocked reading from stdin
+// (a nil cmd.Stdin already reads from os.DevNull, ruled out by inspecting
+// go1.25's os/exec source rather than assumed) — it hangs because it is
+// off waiting on an interactive keychain-unlock prompt that nothing will
+// ever answer. Pointing securityBinary at this script exercises
+// runSecurityFind's own timeout/kill logic deterministically, without
+// depending on real keychain/agent behavior — which is exactly what hung
+// CI for ten minutes and left an orphan `security` process behind.
+func hangingSecurityScript(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "security")
+	script := "#!/bin/sh\nexec sleep 300\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return path
+}
 
 // newScratchKeychain creates a throwaway keychain in a temp directory,
 // unlocked and populated with one generic-password item, and returns its
@@ -50,15 +87,91 @@ func TestGetPassword_NotFound(t *testing.T) {
 }
 
 // TestGetPassword_LockedKeychain reproduces the data-loss scenario from
-// issue #30 by hand: an existing credential that cannot be *read* because
-// the keychain is locked must not be reported as *ErrNotFound (which a
-// caller would treat as "safe to overwrite"). It must come back as
-// something else — here, *ErrUnavailable — carrying real diagnostic text.
+// issue #30: an existing credential that cannot be *read* because the
+// keychain is locked must not be reported as *ErrNotFound (which a caller
+// would treat as "safe to overwrite"). It must come back as something else
+// — here, *ErrUnavailable — carrying real diagnostic text.
+//
+// This drives the scenario with a stand-in security binary that never
+// exits, rather than an actually-locked keychain: against a real locked
+// keychain with no GUI session to answer the unlock prompt, this exact
+// call hung for the full 10-minute CI test timeout and left an orphan
+// `security` process behind (see PR #31's review). Reproducing that
+// through a stand-in makes the test exercise runSecurityFind's own
+// timeout/kill logic deterministically and quickly instead of depending on
+// real, slow, environment-specific keychain-agent behavior — the thing
+// that hung CI in the first place. The real-lock reproduction still exists,
+// opt-in, as TestGetPassword_LockedKeychain_Live below.
 func TestGetPassword_LockedKeychain(t *testing.T) {
+	withStandInSecurity(t, hangingSecurityScript(t), 200*time.Millisecond)
+	k := &Keychain{keychainPath: filepath.Join(t.TempDir(), "irrelevant.keychain-db")}
+
+	start := time.Now()
+	_, err := k.GetPassword("secret-issue30-test-service")
+	elapsed := time.Since(start)
+
+	if elapsed > 10*time.Second {
+		t.Fatalf("GetPassword() took %s to return against an unresponsive security binary; want it bounded near securityCommandTimeout — the timeout/kill logic did not bound the call", elapsed)
+	}
+	if err == nil {
+		t.Fatal("GetPassword() against an unresponsive security binary returned nil error, want a failure")
+	}
+	var notFound *ErrNotFound
+	if errors.As(err, &notFound) {
+		t.Fatalf("GetPassword() against an unresponsive security binary = *ErrNotFound (%v); this is the issue #30 bug — an unreadable credential must not look absent", err)
+	}
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("GetPassword() error = %v (%T), want *ErrUnavailable", err, err)
+	}
+	if unavailable.Reason == "" {
+		t.Fatal("ErrUnavailable.Reason is empty, want a diagnostic")
+	}
+}
+
+// TestGetUsername_LockedKeychain mirrors TestGetPassword_LockedKeychain for
+// GetUsername, which has the same shape per issue #30.
+func TestGetUsername_LockedKeychain(t *testing.T) {
+	withStandInSecurity(t, hangingSecurityScript(t), 200*time.Millisecond)
+	k := &Keychain{keychainPath: filepath.Join(t.TempDir(), "irrelevant.keychain-db")}
+
+	start := time.Now()
+	_, err := k.GetUsername("secret-issue30-test-service")
+	elapsed := time.Since(start)
+
+	if elapsed > 10*time.Second {
+		t.Fatalf("GetUsername() took %s to return against an unresponsive security binary; want it bounded near securityCommandTimeout", elapsed)
+	}
+	if err == nil {
+		t.Fatal("GetUsername() against an unresponsive security binary returned nil error, want a failure")
+	}
+	var notFound *ErrNotFound
+	if errors.As(err, &notFound) {
+		t.Fatalf("GetUsername() against an unresponsive security binary = *ErrNotFound (%v); this is the issue #30 bug", err)
+	}
+	var unavailable *ErrUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("GetUsername() error = %v (%T), want *ErrUnavailable", err, err)
+	}
+}
+
+// TestGetPassword_LockedKeychain_Live reproduces issue #30 against a real,
+// actually-locked scratch keychain rather than a stand-in security binary.
+// It is opt-in (SECRET_LIVE_KEYCHAIN_TEST=1) rather than unconditional,
+// following the precedent set for the D-Bus backend in PR #29
+// (SECRET_LIVE_DBUS_TEST=1): this is the exact call that hung CI for ten
+// minutes on the headless macos-latest runner before securityCommandTimeout
+// existed, and even bounded by it, it is slow, real, environment-dependent
+// I/O with no business running unconditionally on every push. The
+// always-on regression coverage for the actual product fix is
+// TestGetPassword_LockedKeychain above.
+func TestGetPassword_LockedKeychain_Live(t *testing.T) {
+	if os.Getenv("SECRET_LIVE_KEYCHAIN_TEST") != "1" {
+		t.Skip("set SECRET_LIVE_KEYCHAIN_TEST=1 to run against a real, actually-locked scratch keychain")
+	}
 	path, service := newScratchKeychain(t)
 	k := &Keychain{keychainPath: path}
 
-	// Sanity check: readable while unlocked.
 	if _, err := k.GetPassword(service); err != nil {
 		t.Fatalf("GetPassword() before locking: %v", err)
 	}
@@ -85,9 +198,12 @@ func TestGetPassword_LockedKeychain(t *testing.T) {
 	}
 }
 
-// TestGetUsername_LockedKeychain mirrors TestGetPassword_LockedKeychain for
-// GetUsername, which has the same shape per issue #30.
-func TestGetUsername_LockedKeychain(t *testing.T) {
+// TestGetUsername_LockedKeychain_Live mirrors
+// TestGetPassword_LockedKeychain_Live for GetUsername.
+func TestGetUsername_LockedKeychain_Live(t *testing.T) {
+	if os.Getenv("SECRET_LIVE_KEYCHAIN_TEST") != "1" {
+		t.Skip("set SECRET_LIVE_KEYCHAIN_TEST=1 to run against a real, actually-locked scratch keychain")
+	}
 	path, service := newScratchKeychain(t)
 	k := &Keychain{keychainPath: path}
 

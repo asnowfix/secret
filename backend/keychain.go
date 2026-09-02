@@ -4,6 +4,7 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +12,33 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
+
+// securityBinary is the path to the security CLI. It is a var, not a
+// const, so tests can point it at a stand-in binary instead of the real
+// /usr/bin/security.
+var securityBinary = "/usr/bin/security"
+
+// securityCommandTimeout bounds every call to securityBinary. This path is
+// meant to be entirely non-interactive, but /usr/bin/security itself does
+// not honor that on its own: against a locked keychain it can hand off to
+// the system's interactive keychain-unlock UI, and on a headless session
+// (e.g. a CI runner with no logged-in GUI user to answer that prompt) that
+// hand-off blocks forever with no output. This was confirmed to not be a
+// case of Go's exec.Cmd inheriting/blocking on stdin — cmd.Stdin is left
+// nil throughout this file, and since Go 1.20 a nil Stdin makes the child
+// read from os.DevNull (immediate EOF), not from the parent's terminal —
+// so the fix has to bound the call itself, not stdin. It is a var, not a
+// const, so tests can shrink it instead of waiting out the real value.
+var securityCommandTimeout = 10 * time.Second
+
+// errSecurityTimeout is runSecurityFind's sentinel for "the security
+// process did not finish within securityCommandTimeout". It must never be
+// treated as errItemNotFound: an unresponsive keychain is not a confirmed
+// absence, and collapsing the two would recreate the exact silent-overwrite
+// bug (issue #30) this file's error classification exists to prevent.
+var errSecurityTimeout = errors.New("security command did not respond within the timeout")
 
 // Keychain implements Backend using the macOS /usr/bin/security CLI.
 type Keychain struct {
@@ -26,7 +53,10 @@ func NewKeychain() *Keychain {
 }
 
 func (k *Keychain) IsAvailable() error {
-	cmd := exec.Command("/usr/bin/security", "show-keychain-info", k.keychainPath)
+	ctx, cancel := context.WithTimeout(context.Background(), securityCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, securityBinary, "show-keychain-info", k.keychainPath)
+	cmd.Stdin = nil
 	cmd.Stderr = nil
 	cmd.Stdout = nil
 	if err := cmd.Run(); err != nil {
@@ -42,6 +72,9 @@ func (k *Keychain) GetUsername(service string) (string, error) {
 	if err != nil {
 		if errors.Is(err, errItemNotFound) {
 			return "", &ErrNotFound{Service: service}
+		}
+		if errors.Is(err, errSecurityTimeout) {
+			return "", &ErrUnavailable{Reason: keychainTimeoutReason(err)}
 		}
 		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: %v", service, err)}
 	}
@@ -68,19 +101,33 @@ func (k *Keychain) GetPassword(service string) (string, error) {
 		if errors.Is(err, errItemNotFound) {
 			return "", &ErrNotFound{Service: service}
 		}
+		if errors.Is(err, errSecurityTimeout) {
+			return "", &ErrUnavailable{Reason: keychainTimeoutReason(err)}
+		}
 		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: %v", service, err)}
 	}
 	return strings.TrimRight(output, "\n"), nil
 }
 
+// keychainTimeoutReason builds the *ErrUnavailable diagnostic for a
+// security invocation that timed out, naming the likely cause (a locked
+// keychain with no agent able to answer an unlock prompt) rather than a
+// generic failure message.
+func keychainTimeoutReason(err error) string {
+	return fmt.Sprintf("keychain unavailable: security command did not respond, possibly locked with no agent to answer (%v)", err)
+}
+
 func (k *Keychain) Add(service, account, password string) error {
-	cmd := exec.Command("/usr/bin/security", "add-generic-password",
+	ctx, cancel := context.WithTimeout(context.Background(), securityCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, securityBinary, "add-generic-password",
 		"-s", service,
 		"-a", account,
 		"-w", password,
-		"-T", "/usr/bin/security",
+		"-T", securityBinary,
 		k.keychainPath,
 	)
+	cmd.Stdin = nil
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -90,14 +137,20 @@ func (k *Keychain) Add(service, account, password string) error {
 }
 
 func (k *Keychain) Delete(service string) error {
-	cmd := exec.Command("/usr/bin/security", "delete-generic-password", "-s", service, k.keychainPath)
+	ctx, cancel := context.WithTimeout(context.Background(), securityCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, securityBinary, "delete-generic-password", "-s", service, k.keychainPath)
+	cmd.Stdin = nil
 	cmd.Stderr = nil
 	cmd.Stdout = nil
 	if err := cmd.Run(); err == nil {
 		return nil
 	}
 
-	cmd = exec.Command("/usr/bin/security", "delete-internet-password", "-s", service, k.keychainPath)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), securityCommandTimeout)
+	defer cancel2()
+	cmd = exec.CommandContext(ctx2, securityBinary, "delete-internet-password", "-s", service, k.keychainPath)
+	cmd.Stdin = nil
 	cmd.Stderr = nil
 	cmd.Stdout = nil
 	if err := cmd.Run(); err != nil {
@@ -124,18 +177,34 @@ var errItemNotFound = errors.New("keychain item not found")
 // a scratch keychain (see PR description) rather than assumed.
 const secItemNotFoundExitCode = 44
 
-// runSecurityFind runs /usr/bin/security with the given arguments and
-// classifies the result: success returns stdout; a definitive "item not
-// found" exit returns errItemNotFound; anything else (locked keychain,
+// runSecurityFind runs securityBinary with the given arguments, bounded by
+// securityCommandTimeout, and classifies the result: success returns
+// stdout; a definitive "item not found" exit returns errItemNotFound; a
+// timeout returns errSecurityTimeout; anything else (locked keychain,
 // missing/non-executable binary, unexpected exit code) returns an error
 // carrying whatever diagnostic security produced, instead of being folded
 // into "not found".
+//
+// The child is bounded via exec.CommandContext rather than a bare
+// exec.Command: on timeout, the context's default Cancel (os.Process.Kill)
+// terminates the child and the in-flight cmd.Run/Wait call reaps it, so no
+// orphan process is left behind — the exact cleanup CI had to do by hand
+// for the unbounded call this replaces. cmd.Stdin is left nil, i.e.
+// /dev/null, so the child can never block reading from an inherited
+// terminal either.
 func runSecurityFind(args ...string) (string, error) {
-	cmd := exec.Command("/usr/bin/security", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), securityCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, securityBinary, args...)
+	cmd.Stdin = nil
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("%w: security %s against %s", errSecurityTimeout, args[0], securityCommandTimeout)
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == secItemNotFoundExitCode {
 			return "", errItemNotFound
