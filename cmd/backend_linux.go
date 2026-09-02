@@ -13,12 +13,16 @@ import (
 )
 
 func selectBackend() backend.Backend {
+	// trampolineToWindows never returns: it either syscall.Execs onto
+	// secret.exe on the Windows host, or os.Exit(1)s. It must be tried
+	// first and unconditionally win over any native Linux backend — WSL
+	// users want the Windows host's credentials, not a WSL-local keyring,
+	// even if a Secret Service daemon happens to be running inside WSL.
 	if isWSL() {
 		trampolineToWindows()
 	}
-	fmt.Fprintln(os.Stderr, "*** no backend available for linux yet")
-	os.Exit(1)
-	return nil
+	// Native Secret Service backend (GNOME Keyring, KWallet, ...).
+	return backend.NewSecretService()
 }
 
 func isWSL() bool {
