@@ -122,6 +122,22 @@ secret edit                     # open native UI
 
 Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `password`.
 
+## Git credential helper
+
+`secret` also ships a second binary, `git-credential-secret`, that implements git's [credential-helper protocol](https://git-scm.com/docs/gitcredentials) on top of the same platform-native secret store. Once it's on your `PATH` (it's bundled alongside `secret` in every release archive, Scoop package, and `go install` of this module), enable it with:
+
+```sh
+git config --global credential.helper secret
+```
+
+From then on, `git clone`/`git push`/etc. against an HTTPS remote will transparently use a credential already in your OS secret store instead of prompting, and will offer to store one you type interactively so you're not asked again.
+
+A credential stored this way is discoverable — and vice versa — by the plain `secret` CLI: `git` authenticating against `https://github.com/owner/repo.git` looks up (and `secret set`/`secret login`/`secret password` read back) the service `github.com`. That interop is intentional: a credential you stored by hand with `secret set github.com <user> <token>` is picked up by git with no extra configuration, and one git stores interactively (or via `git credential approve`) is readable with `secret login github.com` / `secret password github.com`. If you turn on [`credential.useHttpPath`](https://git-scm.com/docs/gitcredentials#Documentation/gitcredentials.txt-useHttpPath) for a host, the repository path is folded into the service key too (e.g. `github.com/owner/repo.git`), so different repositories under the same host can have distinct stored credentials — git only sends a path in the first place when that option is set, so plain host-only lookups are unaffected either way.
+
+`git config credential.helper secret` works because `git` resolves a bare `credential.helper` value to an executable named `git-credential-<value>` on `PATH` (see `gitcredentials(7)`) — there is no configuration form where git invokes `secret <subcommand>` as a single helper, so this project ships `git-credential-secret` as its own build target rather than a `secret` subcommand.
+
+Only `username`/`password` round-trip through the OS secret store; other credential attributes git's protocol supports (`authtype`, `oauth_refresh_token`, `password_expiry_utc`, ...) are not persisted, since `backend.Backend` has no fields for them.
+
 ## Backends
 
 | Backend | Platform | Status |
