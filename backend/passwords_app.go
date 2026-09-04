@@ -35,8 +35,18 @@ static char* _cfstring_to_cstr(CFStringRef s) {
 // sec_copy_password returns the password for name as a malloc'd string (caller must free),
 // or NULL if not found. Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny is included so iCloud-synced Passwords.app items are searched.
-static char* sec_copy_password(const char *name, OSStatus *st) {
+//
+// The two queries' OSStatus results are reported separately via stGeneric/
+// stInternet, rather than collapsed into one value: if the generic query
+// hits a real failure (e.g. errSecInteractionNotAllowed on a locked
+// keychain) but the internet query simply finds nothing
+// (errSecItemNotFound), a single shared status would report the latter and
+// hide the former, making a "could not determine" failure look like a
+// definitive "not found" to the caller.
+static char* sec_copy_password(const char *name, OSStatus *stGeneric, OSStatus *stInternet) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	*stGeneric = errSecItemNotFound;
+	*stInternet = errSecItemNotFound;
 
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecReturnData, kSecMatchLimit, kSecAttrSynchronizable};
@@ -44,9 +54,9 @@ static char* sec_copy_password(const char *name, OSStatus *st) {
 		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
-		*st = SecItemCopyMatching(q, &r);
+		*stGeneric = SecItemCopyMatching(q, &r);
 		CFRelease(q);
-		if (*st == errSecSuccess && r) {
+		if (*stGeneric == errSecSuccess && r) {
 			char *out = _cfdata_to_cstr((CFDataRef)r);
 			CFRelease(r); CFRelease(n);
 			return out;
@@ -59,9 +69,9 @@ static char* sec_copy_password(const char *name, OSStatus *st) {
 		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
-		*st = SecItemCopyMatching(q, &r);
+		*stInternet = SecItemCopyMatching(q, &r);
 		CFRelease(q);
-		if (*st == errSecSuccess && r) {
+		if (*stInternet == errSecSuccess && r) {
 			char *out = _cfdata_to_cstr((CFDataRef)r);
 			CFRelease(r); CFRelease(n);
 			return out;
@@ -75,8 +85,13 @@ static char* sec_copy_password(const char *name, OSStatus *st) {
 // sec_copy_username returns the account name for name as a malloc'd string (caller must free),
 // or NULL if not found. Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny is included so iCloud-synced Passwords.app items are searched.
-static char* sec_copy_username(const char *name, OSStatus *st) {
+//
+// See sec_copy_password for why stGeneric/stInternet are reported separately
+// instead of being collapsed into one shared status.
+static char* sec_copy_username(const char *name, OSStatus *stGeneric, OSStatus *stInternet) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	*stGeneric = errSecItemNotFound;
+	*stInternet = errSecItemNotFound;
 
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
@@ -84,9 +99,9 @@ static char* sec_copy_username(const char *name, OSStatus *st) {
 		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
-		*st = SecItemCopyMatching(q, &r);
+		*stGeneric = SecItemCopyMatching(q, &r);
 		CFRelease(q);
-		if (*st == errSecSuccess && r) {
+		if (*stGeneric == errSecSuccess && r) {
 			CFStringRef acct = CFDictionaryGetValue((CFDictionaryRef)r, kSecAttrAccount);
 			char *out = acct ? _cfstring_to_cstr(acct) : NULL;
 			CFRelease(r); CFRelease(n);
@@ -100,9 +115,9 @@ static char* sec_copy_username(const char *name, OSStatus *st) {
 		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
 			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 		CFTypeRef r = NULL;
-		*st = SecItemCopyMatching(q, &r);
+		*stInternet = SecItemCopyMatching(q, &r);
 		CFRelease(q);
-		if (*st == errSecSuccess && r) {
+		if (*stInternet == errSecSuccess && r) {
 			CFStringRef acct = CFDictionaryGetValue((CFDictionaryRef)r, kSecAttrAccount);
 			char *out = acct ? _cfstring_to_cstr(acct) : NULL;
 			CFRelease(r); CFRelease(n);
@@ -253,13 +268,34 @@ func (p *PasswordsApp) IsAvailable() error {
 	return nil
 }
 
+// osStatusItemNotFound mirrors C.errSecItemNotFound as a plain int32 so
+// notFoundInBothQueries — and the test that drives it — don't need a cgo
+// preamble; `import "C"` is not permitted in _test.go files.
+var osStatusItemNotFound = int32(C.errSecItemNotFound)
+
+// notFoundInBothQueries reports whether both the generic- and
+// internet-password queries came back with the definitive "no such item"
+// status, as opposed to one of them hitting a real failure (e.g. a locked
+// keychain denying access) that a shared/collapsed status would hide.
+//
+// Note: errSecItemNotFound is also what SecItemCopyMatching returns for an
+// item this unsigned process is not entitled to read (see #20, #27) — that
+// ambiguity is unresolvable at this layer and this function does not (and
+// cannot) distinguish it from a genuine absence.
+func notFoundInBothQueries(stGeneric, stInternet int32) bool {
+	return stGeneric == osStatusItemNotFound && stInternet == osStatusItemNotFound
+}
+
 func (p *PasswordsApp) GetPassword(service string) (string, error) {
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
-	var st C.OSStatus
-	pw := C.sec_copy_password(svc, &st)
+	var stGeneric, stInternet C.OSStatus
+	pw := C.sec_copy_password(svc, &stGeneric, &stInternet)
 	if pw == nil {
-		return "", &ErrNotFound{Service: service}
+		if notFoundInBothQueries(int32(stGeneric), int32(stInternet)) {
+			return "", &ErrNotFound{Service: service}
+		}
+		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: Security error (generic query: %d, internet query: %d)", service, stGeneric, stInternet)}
 	}
 	defer C.free(unsafe.Pointer(pw))
 	return C.GoString(pw), nil
@@ -268,10 +304,13 @@ func (p *PasswordsApp) GetPassword(service string) (string, error) {
 func (p *PasswordsApp) GetUsername(service string) (string, error) {
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
-	var st C.OSStatus
-	user := C.sec_copy_username(svc, &st)
+	var stGeneric, stInternet C.OSStatus
+	user := C.sec_copy_username(svc, &stGeneric, &stInternet)
 	if user == nil {
-		return "", &ErrNotFound{Service: service}
+		if notFoundInBothQueries(int32(stGeneric), int32(stInternet)) {
+			return "", &ErrNotFound{Service: service}
+		}
+		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: Security error (generic query: %d, internet query: %d)", service, stGeneric, stInternet)}
 	}
 	defer C.free(unsafe.Pointer(user))
 	return C.GoString(user), nil

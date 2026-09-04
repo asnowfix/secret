@@ -83,6 +83,33 @@ After that, `secret` works transparently from your WSL shell — credentials are
 
 If `secret.exe` is not found on the Windows `PATH`, `secret` will print an error with installation instructions.
 
+#### Scoop installed after WSL was already running
+
+WSL takes a snapshot of the Windows `PATH` at launch. If you installed Scoop (or `secret`) after your WSL session was already open, WSL won't see Scoop's shims directory yet and `secret.exe` will appear missing.
+
+First, make sure Scoop's shims directory is in your **permanent** Windows user `PATH` (from PowerShell):
+
+```powershell
+# Check — should print a line containing "scoop\shims"
+[Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Select-String "scoop"
+
+# If missing, add it:
+$old = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$old;$env:USERPROFILE\scoop\shims", "User")
+```
+
+Then restart WSL so it picks up the updated `PATH`:
+
+```powershell
+wsl --shutdown
+```
+
+Reopen your WSL terminal and verify:
+
+```sh
+which secret.exe
+```
+
 ## Usage
 
 ```sh
@@ -96,6 +123,22 @@ secret list                     # list service names of all secrets in the backe
 
 Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `password`.
 
+## Git credential helper
+
+`secret` also ships a second binary, `git-credential-secret`, that implements git's [credential-helper protocol](https://git-scm.com/docs/gitcredentials) on top of the same platform-native secret store. Once it's on your `PATH` (it's bundled alongside `secret` in every release archive, Scoop package, and `go install` of this module), enable it with:
+
+```sh
+git config --global credential.helper secret
+```
+
+From then on, `git clone`/`git push`/etc. against an HTTPS remote will transparently use a credential already in your OS secret store instead of prompting, and will offer to store one you type interactively so you're not asked again.
+
+A credential stored this way is discoverable — and vice versa — by the plain `secret` CLI: `git` authenticating against `https://github.com/owner/repo.git` looks up (and `secret set`/`secret login`/`secret password` read back) the service `github.com`. That interop is intentional: a credential you stored by hand with `secret set github.com <user> <token>` is picked up by git with no extra configuration, and one git stores interactively (or via `git credential approve`) is readable with `secret login github.com` / `secret password github.com`. If you turn on [`credential.useHttpPath`](https://git-scm.com/docs/gitcredentials#Documentation/gitcredentials.txt-useHttpPath) for a host, the repository path is folded into the service key too (e.g. `github.com/owner/repo.git`), so different repositories under the same host can have distinct stored credentials — git only sends a path in the first place when that option is set, so plain host-only lookups are unaffected either way.
+
+`git config credential.helper secret` works because `git` resolves a bare `credential.helper` value to an executable named `git-credential-<value>` on `PATH` (see `gitcredentials(7)`) — there is no configuration form where git invokes `secret <subcommand>` as a single helper, so this project ships `git-credential-secret` as its own build target rather than a `secret` subcommand.
+
+Only `username`/`password` round-trip through the OS secret store; other credential attributes git's protocol supports (`authtype`, `oauth_refresh_token`, `password_expiry_utc`, ...) are not persisted, since `backend.Backend` has no fields for them.
+
 ## Backends
 
 | Backend | Platform | Status |
@@ -104,8 +147,8 @@ Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `pas
 | macOS Keychain (`/usr/bin/security`) | macOS | Implemented — fallback on macOS < 15; selectable via `--keychain` |
 | Windows Credential Manager | Windows | Implemented |
 | WSL trampoline → `secret.exe` | WSL | Implemented |
+| GNOME libsecret / Secret Service (D-Bus) | Linux | Implemented — unverified on a real desktop, see below |
 | Passwords.app: Safari/iCloud credentials | macOS 15+ | Planned — requires code signing + entitlements ([#20](https://github.com/asnowfix/secret/issues/20)) |
-| GNOME libsecret / Secret Service | Linux | Planned |
 | KeePassXC | macOS, Linux, Windows | Planned |
 
 ### macOS — Passwords.app (default on macOS 15+)
@@ -144,6 +187,20 @@ The implementation calls `Advapi32.dll` directly via Go syscalls — no cgo, no 
 `secret edit` opens the built-in Credential Manager UI (`control.exe /name Microsoft.CredentialManager`) where stored entries are visible under **Windows Credentials → Generic Credentials**.
 
 `secret list` calls `CredEnumerateW` to enumerate every `CRED_TYPE_GENERIC` credential visible to the current user, not just ones added by `secret`.
+
+### Linux — GNOME libsecret / Secret Service (D-Bus)
+
+Talks directly to the [Secret Service API](https://specifications.freedesktop.org/secret-service/latest/) over D-Bus (`github.com/godbus/dbus/v5`), rather than shelling out to `secret-tool` or adopting a third-party keyring library — see the implementation PR for the full comparison. This is a generic client against the spec, not a GNOME-only integration, so it should in principle also work against KWallet's `ksecretd` (which implements the same D-Bus interface) — but that has never actually been run or tested, only `gnome-keyring-daemon` has.
+
+Credentials are tagged with `service` and `username` attributes (the same convention Python's `keyring` SecretService backend uses), stored in the default collection, and readable by other Secret-Service-aware tools.
+
+> **Not verified on a real desktop, and only partially verified against a real daemon at all**: the maintainer has no Linux machine with a GNOME/KDE session. This backend is exercised end-to-end in CI against a real `gnome-keyring-daemon`, headless, via `dbus-run-session` (see `.github/workflows/ci.yml` and `backend/libsecret_live_test.go`), which does confirm happy-path CRUD and single-collection enumeration genuinely work against a real daemon. But CI force-`--unlock`s the daemon before the test runs, so the entire Secret Service Prompt object protocol — the mechanism behind unlocking a locked item and behind interactive consent on `Add` — has never executed against any real implementation, not just its GUI-display aspect. Nor is any of this the same as a logged-in desktop session, where the keyring may already be unlocked via PAM at login or may prompt interactively. If you hit an issue on a real desktop, especially around unlocking or prompts, please report it.
+
+`secret edit` has no native equivalent to open on Linux (there is no single credential-manager UI guaranteed to be installed the way there is on macOS/Windows) and returns an error suggesting `secret-tool` or a keyring GUI like Seahorse instead.
+
+### WSL trampoline
+
+On WSL, `secret` re-execs `secret.exe` on the Windows host (see [WSL](#wsl-windows-subsystem-for-linux) above) *before* considering the Linux Secret Service backend — WSL users get the Windows Credential Manager, not a WSL-local keyring, even if one happens to be running.
 
 ## Building
 

@@ -6,6 +6,14 @@ before:
     - go mod tidy
     - go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
     - goversioninfo -o resource_windows.syso
+    # goversioninfo only embeds the PE metadata (see commit "Add Windows PE
+    # metadata and keep debug symbols to reduce AV false positives") into the
+    # main package it's invoked for — Go auto-links a resource_windows.syso
+    # only from the same directory as the main package being built. Copying
+    # it into cmd/git-credential-secret gives that binary the same metadata
+    # (and the same Darwin-CGO-linker guard the "_windows" suffix provides)
+    # as the root secret.exe build.
+    - cp resource_windows.syso cmd/git-credential-secret/resource_windows.syso
 
 builds:
   - id: secret-darwin
@@ -45,6 +53,51 @@ builds:
       - amd64
     ldflags:
       - -X github.com/asnowfix/secret/cmd.version={{ .Tag }}
+
+  # git-credential-secret is a separate binary, not a `secret` subcommand:
+  # `credential.helper = secret` makes git exec `git-credential-secret` by
+  # name (see gitcredentials(7)), so it has to be reachable under that exact
+  # name on PATH. Bundled into the same archives as `secret` below (the
+  # `archives` block does not restrict `builds`, so it defaults to all of
+  # them) so it ships automatically with every install path.
+  - id: git-credential-secret-darwin
+    main: ./cmd/git-credential-secret
+    binary: git-credential-secret
+    env:
+      # Must match secret-darwin: this binary links package cmd, which
+      # imports backend, whose backend_darwin.go unconditionally references
+      # the cgo-based PasswordsApp backend (backend/passwords_app.go).
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+  - id: git-credential-secret-linux
+    main: ./cmd/git-credential-secret
+    binary: git-credential-secret
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+  - id: git-credential-secret-windows
+    main: ./cmd/git-credential-secret
+    binary: git-credential-secret
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
 
 archives:
   - id: secret
