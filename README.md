@@ -54,9 +54,9 @@ scoop install secret
 
 ### WSL (Windows Subsystem for Linux)
 
-The Linux `secret` binary auto-detects WSL and trampolines every command to `secret.exe` on the Windows host. Two steps are required:
+The Linux `secret` binary auto-detects WSL and trampolines every command to `secret.exe` on the Windows host. The same applies to `git-credential-secret` (see [Git credential helper](#git-credential-helper) below): a WSL-built `git-credential-secret`, invoked by `git` under that exact name, trampolines to `git-credential-secret.exe` on the Windows host — not to `secret.exe`, which has no matching subcommand. Which Windows-side binary a given WSL binary trampolines to is derived from its own name, so this falls out of installing both `secret.exe` and `git-credential-secret.exe` on the Windows host the same way (they ship together in every release archive, Scoop package, and winget install). Two steps are required:
 
-**1. Install `secret.exe` on the Windows host** (from a PowerShell or cmd prompt, not inside WSL):
+**1. Install `secret.exe` (and `git-credential-secret.exe`, if you use the git credential helper) on the Windows host** (from a PowerShell or cmd prompt, not inside WSL):
 
 ```powershell
 winget install asnowfix.secret
@@ -79,9 +79,9 @@ go install github.com/asnowfix/secret@latest
 
 Or download the `linux` archive from the [releases page](https://github.com/asnowfix/secret/releases) and place the binary on your `PATH`.
 
-After that, `secret` works transparently from your WSL shell — credentials are stored in the Windows Credential Manager on the host.
+After that, `secret` (and `git-credential-secret`, if built alongside it — e.g. via `go install github.com/asnowfix/secret/cmd/git-credential-secret@latest`) works transparently from your WSL shell — credentials are stored in the Windows Credential Manager on the host.
 
-If `secret.exe` is not found on the Windows `PATH`, `secret` will print an error with installation instructions.
+If the Windows-side counterpart binary (`secret.exe` or `git-credential-secret.exe`, matching whichever one you ran) is not found on the Windows `PATH`, the WSL binary will print an error with installation instructions.
 
 #### Scoop installed after WSL was already running
 
@@ -138,6 +138,8 @@ A credential stored this way is discoverable — and vice versa — by the plain
 
 Only `username`/`password` round-trip through the OS secret store; other credential attributes git's protocol supports (`authtype`, `oauth_refresh_token`, `password_expiry_utc`, ...) are not persisted, since `backend.Backend` has no fields for them.
 
+Under WSL, a WSL-built `git-credential-secret` trampolines to `git-credential-secret.exe` on the Windows host, the same way `secret` trampolines to `secret.exe` — see [WSL](#wsl-windows-subsystem-for-linux) above.
+
 ## Backends
 
 | Backend | Platform | Status |
@@ -145,7 +147,7 @@ Only `username`/`password` round-trip through the OS secret store; other credent
 | Passwords.app (Security framework, cgo) | macOS 15+ | Implemented — default on macOS 15+ |
 | macOS Keychain (`/usr/bin/security`) | macOS | Implemented — fallback on macOS < 15; selectable via `--keychain` |
 | Windows Credential Manager | Windows | Implemented |
-| WSL trampoline → `secret.exe` | WSL | Implemented |
+| WSL trampoline → `secret.exe` / `git-credential-secret.exe` | WSL | Implemented |
 | GNOME libsecret / Secret Service (D-Bus) | Linux | Implemented — unverified on a real desktop, see below |
 | Passwords.app: Safari/iCloud credentials | macOS 15+ | Planned — requires code signing + entitlements ([#20](https://github.com/asnowfix/secret/issues/20)) |
 | KeePassXC | macOS, Linux, Windows | Planned |
@@ -193,7 +195,7 @@ Credentials are tagged with `service` and `username` attributes (the same conven
 
 ### WSL trampoline
 
-On WSL, `secret` re-execs `secret.exe` on the Windows host (see [WSL](#wsl-windows-subsystem-for-linux) above) *before* considering the Linux Secret Service backend — WSL users get the Windows Credential Manager, not a WSL-local keyring, even if one happens to be running.
+On WSL, `secret` re-execs `secret.exe` on the Windows host (see [WSL](#wsl-windows-subsystem-for-linux) above) *before* considering the Linux Secret Service backend — WSL users get the Windows Credential Manager, not a WSL-local keyring, even if one happens to be running. `git-credential-secret` shares this same trampoline logic and re-execs `git-credential-secret.exe` — its own Windows-native counterpart, not `secret.exe` — since the two binaries take different command-line protocols (`secret <subcommand> <service>` vs. `git-credential-secret <get|store|erase>`).
 
 ## Building
 
