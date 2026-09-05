@@ -9,16 +9,16 @@ Provide a single `secret` binary that works identically across macOS, Linux, and
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   CLI (Cobra)                    │
-│  secret login|password|add|delete|edit <service> │
-└────────────────────────┬────────────────────────┘
-                         │
-                         ▼
+┌───────────────────────────────────────────────────────┐
+│                      CLI (Cobra)                      │
+│  secret login|password|add|delete|edit|list <service> │
+└───────────────────────────┬───────────────────────────┘
+                            │
+                            ▼
 ┌─────────────────────────────────────────────────┐
 │              backend.Backend interface           │
 │  IsAvailable · GetUsername · GetPassword         │
-│  Add · Delete · Edit                            │
+│  Add · Delete · Edit · List                     │
 └────┬──────────┬──────────┬──────────┬───────────┘
      │          │          │          │
      ▼          ▼          ▼          ▼
@@ -118,6 +118,7 @@ secret password <service>       # retrieve password
 secret set <service> [account] <password>  # store credential (overwrites if exists)
 secret delete <service>         # remove credential
 secret edit                     # open native UI
+secret list                     # list service names of all secrets in the backend
 ```
 
 Aliases: `username` and `client_id` map to `login`; `client_secret` maps to `password`.
@@ -158,6 +159,8 @@ Both `kSecClassGenericPassword` (by `kSecAttrService`) and `kSecClassInternetPas
 
 `secret edit` opens Passwords.app (`com.apple.Passwords`), which shows all credential types in one view.
 
+`secret list` queries both classes with `kSecMatchLimitAll` and returns the deduplicated, sorted set of service/server names.
+
 > **Limitation**: credentials saved by Safari are stored in the data-protection keychain with access controls that block unsigned processes. `secret` can read and write credentials it manages itself; accessing Safari-saved credentials requires a signed binary with the `keychain-access-groups` entitlement ([#20](https://github.com/asnowfix/secret/issues/20)).
 
 #### Forcing the Keychain backend on macOS
@@ -173,6 +176,8 @@ secret -k set myservice user pass
 
 Shells out to `/usr/bin/security` targeting `~/Library/Keychains/login.keychain-db`. Used automatically on macOS < 15, or when `--keychain` is passed.
 
+`secret list` parses `security dump-keychain` output for `svce`/`srvr` attributes, which is metadata visible without unlocking the keychain.
+
 ### Windows Credential Manager
 
 Credentials are stored as **Generic** entries (`CRED_TYPE_GENERIC`) with machine-level persistence (`CRED_PERSIST_LOCAL_MACHINE`), making them available to all processes on the machine under the current user account.
@@ -180,6 +185,8 @@ Credentials are stored as **Generic** entries (`CRED_TYPE_GENERIC`) with machine
 The implementation calls `Advapi32.dll` directly via Go syscalls — no cgo, no third-party library. Passwords are stored as UTF-16LE blobs, matching Windows' native string encoding for credential data.
 
 `secret edit` opens the built-in Credential Manager UI (`control.exe /name Microsoft.CredentialManager`) where stored entries are visible under **Windows Credentials → Generic Credentials**.
+
+`secret list` calls `CredEnumerateW` to enumerate every `CRED_TYPE_GENERIC` credential visible to the current user, not just ones added by `secret`.
 
 ### Linux — GNOME libsecret / Secret Service (D-Bus)
 

@@ -59,6 +59,14 @@ func (f *fakeGitCredentialBackend) Delete(service string) error {
 
 func (f *fakeGitCredentialBackend) Edit() error { return nil }
 
+func (f *fakeGitCredentialBackend) List() ([]string, error) {
+	services := make([]string, 0, len(f.creds))
+	for service := range f.creds {
+		services = append(services, service)
+	}
+	return services, nil
+}
+
 var _ backend.Backend = (*fakeGitCredentialBackend)(nil)
 
 func TestParseGitCredentialInput(t *testing.T) {

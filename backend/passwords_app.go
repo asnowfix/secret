@@ -143,6 +143,77 @@ static OSStatus sec_add_generic_password(const char *service, const char *accoun
 	return st;
 }
 
+// sec_copy_all_services returns all service/server names as a "\n"-joined,
+// malloc'd C string (caller must free), or NULL if none were found. Searches
+// both kSecClassGenericPassword and kSecClassInternetPassword, including
+// iCloud-synced Passwords.app items.
+//
+// The two queries are independent, so their OSStatus results are reported
+// separately via stGeneric/stInternet rather than collapsed into one value:
+// the caller needs to be able to tell a genuine "no items" (errSecItemNotFound
+// from both) apart from macOS denying access to one or both keychains, and
+// to decide what to do when the two queries disagree.
+static char* sec_copy_all_services(OSStatus *stGeneric, OSStatus *stInternet) {
+	CFMutableStringRef out = CFStringCreateMutable(NULL, 0);
+	int found = 0;
+
+	{
+		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFTypeRef r = NULL;
+		*stGeneric = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*stGeneric == errSecSuccess && r) {
+			CFArrayRef arr = (CFArrayRef)r;
+			CFIndex n = CFArrayGetCount(arr);
+			for (CFIndex i = 0; i < n; i++) {
+				CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+				CFStringRef svc = CFDictionaryGetValue(item, kSecAttrService);
+				if (svc) {
+					if (found) CFStringAppend(out, CFSTR("\n"));
+					CFStringAppend(out, svc);
+					found = 1;
+				}
+			}
+			CFRelease(r);
+		}
+	}
+
+	{
+		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFTypeRef r = NULL;
+		*stInternet = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*stInternet == errSecSuccess && r) {
+			CFArrayRef arr = (CFArrayRef)r;
+			CFIndex n = CFArrayGetCount(arr);
+			for (CFIndex i = 0; i < n; i++) {
+				CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+				CFStringRef svc = CFDictionaryGetValue(item, kSecAttrServer);
+				if (svc) {
+					if (found) CFStringAppend(out, CFSTR("\n"));
+					CFStringAppend(out, svc);
+					found = 1;
+				}
+			}
+			CFRelease(r);
+		}
+	}
+
+	if (!found) {
+		CFRelease(out);
+		return NULL;
+	}
+	char *result = _cfstring_to_cstr(out);
+	CFRelease(out);
+	return result;
+}
+
 // sec_delete_item deletes an item by service name.
 // Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny ensures iCloud-synced items can be deleted too.
@@ -179,6 +250,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"unsafe"
 )
 
@@ -272,4 +344,49 @@ func (p *PasswordsApp) Delete(service string) error {
 
 func (p *PasswordsApp) Edit() error {
 	return exec.Command("open", "-b", "com.apple.Passwords").Start()
+}
+
+// List returns the deduplicated, sorted service names found across the
+// generic-password and internet-password keychain classes.
+//
+// The two underlying SecItemCopyMatching queries are independent and can
+// disagree: one may succeed while the other is denied (e.g.
+// errSecInteractionNotAllowed on a locked keychain), or both may genuinely
+// find nothing (errSecItemNotFound, which is not an error). If either query
+// fails for a reason other than "not found", List returns an error rather
+// than silently returning whatever the other query found — a partial
+// result would reintroduce the same "denied looks like empty" problem this
+// method exists to avoid, just for half the store instead of all of it.
+func (p *PasswordsApp) List() ([]string, error) {
+	var stGeneric, stInternet C.OSStatus
+	raw := C.sec_copy_all_services(&stGeneric, &stInternet)
+	defer func() {
+		if raw != nil {
+			C.free(unsafe.Pointer(raw))
+		}
+	}()
+
+	if isRealFailure(int32(stGeneric)) || isRealFailure(int32(stInternet)) {
+		return nil, fmt.Errorf("failed to list secrets: Security error (generic query: %d, internet query: %d)", stGeneric, stInternet)
+	}
+
+	if raw == nil {
+		return []string{}, nil
+	}
+	return DedupeSortServices(strings.Split(C.GoString(raw), "\n")), nil
+}
+
+// secSuccessStatus and secItemNotFoundStatus mirror the OSStatus values
+// isRealFailure treats as "not a failure", captured as plain int32s rather
+// than referenced as C.OSStatus so isRealFailure — and the test that drives
+// it — don't need a cgo preamble; cgo is not supported in _test.go files.
+var (
+	secSuccessStatus      = int32(C.errSecSuccess)
+	secItemNotFoundStatus = int32(C.errSecItemNotFound)
+)
+
+// isRealFailure reports whether st represents an actual failure to query
+// the keychain, as opposed to success or a genuine "no items" result.
+func isRealFailure(st int32) bool {
+	return st != secSuccessStatus && st != secItemNotFoundStatus
 }

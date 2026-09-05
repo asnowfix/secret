@@ -67,6 +67,10 @@ func (k *Keychain) IsAvailable() error {
 
 var acctRegexp = regexp.MustCompile(`^\s+"acct"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
 
+// svceRegexp matches the "svce" (generic password) or "srvr" (internet password)
+// attribute lines emitted by `security dump-keychain`.
+var svceRegexp = regexp.MustCompile(`^\s+"(?:svce|srvr)"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
+
 func (k *Keychain) GetUsername(service string) (string, error) {
 	output, err := k.findPassword(service, false)
 	if err != nil {
@@ -131,7 +135,10 @@ func (k *Keychain) Add(service, account, password string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to add secret for '%s': %s", service, strings.TrimSpace(stderr.String()))
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("failed to add secret for '%s': %s", service, msg)
+		}
+		return fmt.Errorf("failed to add secret for '%s': %w", service, err)
 	}
 	return nil
 }
@@ -161,6 +168,51 @@ func (k *Keychain) Delete(service string) error {
 
 func (k *Keychain) Edit() error {
 	return exec.Command("open", "-b", "com.apple.keychainaccess").Start()
+}
+
+func (k *Keychain) List() ([]string, error) {
+	cmd := exec.Command("/usr/bin/security", "dump-keychain", k.keychainPath)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %s", msg)}
+		}
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %s", err)}
+	}
+	return parseKeychainDumpServices(stdout.String()), nil
+}
+
+// parseKeychainDumpServices extracts the deduplicated, sorted set of service
+// names from `security dump-keychain` output, matching "svce" (generic
+// password) and "srvr" (internet password) attribute lines.
+func parseKeychainDumpServices(dump string) []string {
+	var names []string
+	for _, line := range strings.Split(dump, "\n") {
+		m := svceRegexp.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+
+		var name string
+		switch {
+		case m[1] != "":
+			name = m[1]
+		case m[2] != "":
+			decoded, err := hexDecode(m[2])
+			if err != nil {
+				continue
+			}
+			name = decoded
+		default:
+			continue
+		}
+
+		names = append(names, name)
+	}
+	return DedupeSortServices(names)
 }
 
 // errItemNotFound is findPassword's internal sentinel for a definitive "no
