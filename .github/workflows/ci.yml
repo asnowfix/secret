@@ -32,6 +32,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq dbus-x11 gnome-keyring
+          # Built once here (needs no D-Bus session) and invoked below, from
+          # inside the live session: this is the actual git-credential-secret
+          # binary (cmd/git-credential-secret), not just the backend library
+          # it wraps.
+          go build -o /tmp/git-credential-secret ./cmd/git-credential-secret
           dbus-run-session -- bash -c '
             eval $(printf "\n" | gnome-keyring-daemon --unlock --daemonize --components=secrets)
             export GNOME_KEYRING_CONTROL
@@ -60,4 +65,58 @@ jobs:
               exit 1
             fi
             SECRET_LIVE_DBUS_TEST=1 go test ./backend/... -run TestSecretServiceLive -v
+
+            # The test above proves the Secret Service backend
+            # (backend/libsecret.go) itself works against a real daemon, but
+            # nothing in CI has ever run git-credential-secret as a binary
+            # through gits actual credential-helper protocol against that
+            # same daemon. Do that here, in the same live session, for the
+            # same reason as above: no Linux desktop is available to debug
+            # this interactively, so bound tightly and fail loudly on any
+            # assertion that does not hold rather than let a broken helper
+            # pass silently.
+            HELPER=/tmp/git-credential-secret
+
+            # 1. store: invoke the helper binary directly, the same way git
+            # itself invokes a configured credential.helper (one op per
+            # call, attributes on stdin), per git-credential(1).
+            printf "protocol=https\nhost=example.com\nusername=citest\npassword=citestpw\n\n" | "$HELPER" store
+
+            # 2. fill: fetch it back through gits real "git credential fill"
+            # plumbing instead of calling the binary directly a second time,
+            # so this proves git itself can drive the helper end-to-end, not
+            # just that the binary understands its own wire format.
+            # credential.helper is blanked out first because it is a
+            # multi-valued config key that -c accumulates onto rather than
+            # replaces, and this runner (or the checked-out repo) may already
+            # have one configured; the blank entry makes HELPER the only
+            # helper git consults below, with no global config touched.
+            printf "protocol=https\nhost=example.com\n\n" \
+              | GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=$HELPER credential fill \
+              > /tmp/git-credential-secret-fill.out
+            cat /tmp/git-credential-secret-fill.out
+            if ! grep -qx "password=citestpw" /tmp/git-credential-secret-fill.out; then
+              echo "git credential fill did not return the password stored via git-credential-secret" >&2
+              exit 1
+            fi
+
+            # 3. reject: erase the credential through "git credential reject"
+            # (-> the helpers erase op), then confirm a subsequent fill no
+            # longer finds it. With no other helper configured and terminal
+            # prompting disabled, git must fail outright rather than
+            # fabricate a credential, so a non-zero exit here is the positive
+            # assertion that erase actually worked.
+            printf "protocol=https\nhost=example.com\nusername=citest\npassword=citestpw\n\n" \
+              | git -c credential.helper= -c credential.helper=$HELPER credential reject
+
+            if printf "protocol=https\nhost=example.com\n\n" \
+              | GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=$HELPER credential fill \
+              > /tmp/git-credential-secret-fill-after-reject.out 2>&1
+            then
+              echo "git credential fill still returned a credential after reject:" >&2
+              cat /tmp/git-credential-secret-fill-after-reject.out >&2
+              exit 1
+            fi
+            echo "confirmed erase:"
+            cat /tmp/git-credential-secret-fill-after-reject.out
           '
