@@ -138,13 +138,13 @@ func (c *CredentialManager) Delete(service string) error {
 	if err != nil {
 		return err
 	}
-	r, _, _ := procCredDelete.Call(
+	r, _, e := procCredDelete.Call(
 		uintptr(unsafe.Pointer(targetPtr)),
 		uintptr(credTypeGeneric),
 		0,
 	)
 	if r == 0 {
-		return &ErrNotFound{Service: service}
+		return classifyCredError(service, "delete", e)
 	}
 	return nil
 }
@@ -193,14 +193,29 @@ func credReadW(service string) (*nativeCredential, error) {
 		return nil, err
 	}
 	var pcred *nativeCredential
-	r, _, _ := procCredRead.Call(
+	r, _, e := procCredRead.Call(
 		uintptr(unsafe.Pointer(targetPtr)),
 		uintptr(credTypeGeneric),
 		0,
 		uintptr(unsafe.Pointer(&pcred)),
 	)
 	if r == 0 {
-		return nil, &ErrNotFound{Service: service}
+		return nil, classifyCredError(service, "read", e)
 	}
 	return pcred, nil
+}
+
+// classifyCredError maps the Win32 error from a failed CredReadW/CredDeleteW
+// call into the Backend error type classifySetTarget (cmd/set.go) relies on
+// to decide whether a target already exists: *ErrNotFound only for the
+// confirmed ERROR_NOT_FOUND sentinel (mirroring the e == windows.ERROR_NOT_FOUND
+// check List already uses against CredEnumerateW's error), and *ErrUnavailable
+// for every other failure so a real error (e.g. access denied, an invalid
+// logon session) surfaces as "could not tell" rather than being misread as
+// "does not exist" and silently overwritten (#32, same bug class as #30).
+func classifyCredError(service, op string, e error) error {
+	if e == windows.ERROR_NOT_FOUND {
+		return &ErrNotFound{Service: service}
+	}
+	return &ErrUnavailable{Reason: fmt.Sprintf("failed to %s credential for '%s': %s", op, service, e)}
 }
