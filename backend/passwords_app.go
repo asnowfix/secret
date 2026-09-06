@@ -268,11 +268,6 @@ func (p *PasswordsApp) IsAvailable() error {
 	return nil
 }
 
-// osStatusItemNotFound mirrors C.errSecItemNotFound as a plain int32 so
-// notFoundInBothQueries — and the test that drives it — don't need a cgo
-// preamble; `import "C"` is not permitted in _test.go files.
-var osStatusItemNotFound = int32(C.errSecItemNotFound)
-
 // notFoundInBothQueries reports whether both the generic- and
 // internet-password queries came back with the definitive "no such item"
 // status, as opposed to one of them hitting a real failure (e.g. a locked
@@ -283,7 +278,23 @@ var osStatusItemNotFound = int32(C.errSecItemNotFound)
 // ambiguity is unresolvable at this layer and this function does not (and
 // cannot) distinguish it from a genuine absence.
 func notFoundInBothQueries(stGeneric, stInternet int32) bool {
-	return stGeneric == osStatusItemNotFound && stInternet == osStatusItemNotFound
+	return stGeneric == secItemNotFoundStatus && stInternet == secItemNotFoundStatus
+}
+
+// classifyPasswordsAppLookup maps the pair of OSStatus values behind a NULL
+// sec_copy_password/sec_copy_username result onto the Backend error types
+// callers switch on, mirroring classifySecurityError (keychain.go),
+// classifyBusError (libsecret.go) and classifyCredError (wincred.go). It is
+// one function rather than a copy per accessor because divergence between two
+// copies of an error classification stays invisible until it costs a
+// credential.
+func classifyPasswordsAppLookup(service string, stGeneric, stInternet int32) error {
+	if notFoundInBothQueries(stGeneric, stInternet) {
+		return &ErrNotFound{Service: service}
+	}
+	return &ErrUnavailable{Reason: fmt.Sprintf(
+		"could not read keychain item for %q: Security error (generic query: %d, internet query: %d)",
+		service, stGeneric, stInternet)}
 }
 
 func (p *PasswordsApp) GetPassword(service string) (string, error) {
@@ -292,10 +303,7 @@ func (p *PasswordsApp) GetPassword(service string) (string, error) {
 	var stGeneric, stInternet C.OSStatus
 	pw := C.sec_copy_password(svc, &stGeneric, &stInternet)
 	if pw == nil {
-		if notFoundInBothQueries(int32(stGeneric), int32(stInternet)) {
-			return "", &ErrNotFound{Service: service}
-		}
-		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: Security error (generic query: %d, internet query: %d)", service, stGeneric, stInternet)}
+		return "", classifyPasswordsAppLookup(service, int32(stGeneric), int32(stInternet))
 	}
 	defer C.free(unsafe.Pointer(pw))
 	return C.GoString(pw), nil
@@ -307,10 +315,7 @@ func (p *PasswordsApp) GetUsername(service string) (string, error) {
 	var stGeneric, stInternet C.OSStatus
 	user := C.sec_copy_username(svc, &stGeneric, &stInternet)
 	if user == nil {
-		if notFoundInBothQueries(int32(stGeneric), int32(stInternet)) {
-			return "", &ErrNotFound{Service: service}
-		}
-		return "", &ErrUnavailable{Reason: fmt.Sprintf("could not read keychain item for %q: Security error (generic query: %d, internet query: %d)", service, stGeneric, stInternet)}
+		return "", classifyPasswordsAppLookup(service, int32(stGeneric), int32(stInternet))
 	}
 	defer C.free(unsafe.Pointer(user))
 	return C.GoString(user), nil
@@ -378,8 +383,9 @@ func (p *PasswordsApp) List() ([]string, error) {
 
 // secSuccessStatus and secItemNotFoundStatus mirror the OSStatus values
 // isRealFailure treats as "not a failure", captured as plain int32s rather
-// than referenced as C.OSStatus so isRealFailure — and the test that drives
-// it — don't need a cgo preamble; cgo is not supported in _test.go files.
+// than referenced as C.OSStatus so isRealFailure and notFoundInBothQueries —
+// and the tests that drive them — don't need a cgo preamble; cgo is not
+// supported in _test.go files.
 var (
 	secSuccessStatus      = int32(C.errSecSuccess)
 	secItemNotFoundStatus = int32(C.errSecItemNotFound)
