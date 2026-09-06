@@ -92,11 +92,51 @@ func keychainUnavailableReason(path string, err error) string {
 	return fmt.Sprintf("could not open keychain %s: %v — if it is locked, run `security unlock-keychain %s`", path, err, path)
 }
 
-var acctRegexp = regexp.MustCompile(`^\s+"acct"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
+// attributeRegexp builds a matcher for the attribute lines `security` writes
+// for a keychain item — `    "acct"<blob>="alice"`, or the `0x<hex>` form it
+// uses for a value it cannot render as plain text. names is an alternation of
+// the attribute names to match.
+//
+// The two parsers below share this (and parseAttribute) deliberately: they
+// had drifted apart once already, with issue #36's dropped hexDecode error
+// fixed in parseAccount and left standing in parseKeychainDumpServices.
+func attributeRegexp(names string) *regexp.Regexp {
+	return regexp.MustCompile(`^\s+"(?:` + names + `)"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
+}
+
+var acctRegexp = attributeRegexp("acct")
 
 // svceRegexp matches the "svce" (generic password) or "srvr" (internet password)
 // attribute lines emitted by `security dump-keychain`.
-var svceRegexp = regexp.MustCompile(`^\s+"(?:svce|srvr)"<[^>]*>=(?:"([^"]*)"|0x([0-9A-Fa-f]+))`)
+var svceRegexp = attributeRegexp("svce|srvr")
+
+// parseAttribute returns the value of the attribute on line, decoding the
+// `0x<hex>` rendering if that is the form used. ok reports whether line is an
+// attribute line at all; err is non-nil only for a value that is present but
+// undecodable, which is a parse failure and never an absence.
+//
+// It matches by submatch *index* rather than by submatch string because the
+// two are not equivalent for the quoted branch: `"acct"<blob>=""` is a
+// present-but-empty value, and reading it back as the empty string makes it
+// indistinguishable from "the quoted branch did not participate". The hex
+// branch cannot produce an empty value (it requires at least one hex digit),
+// so an empty string from FindStringSubmatch means exactly one thing — and
+// treating that one thing as unreadable is what made an empty account report
+// as a broken keychain item.
+func parseAttribute(re *regexp.Regexp, line string) (value string, ok bool, err error) {
+	m := re.FindStringSubmatchIndex(line)
+	if m == nil {
+		return "", false, nil
+	}
+	if quoted := m[2]; quoted >= 0 {
+		return line[quoted:m[3]], true, nil
+	}
+	decoded, err := hexDecode(line[m[4]:m[5]])
+	if err != nil {
+		return "", true, err
+	}
+	return decoded, true, nil
+}
 
 func (k *Keychain) GetUsername(service string) (string, error) {
 	output, err := k.findPassword(service, false)
@@ -120,21 +160,17 @@ func (k *Keychain) GetUsername(service string) (string, error) {
 // treats *ErrNotFound as "safe to overwrite".
 func parseAccount(output string) (string, error) {
 	for _, line := range strings.Split(output, "\n") {
-		m := acctRegexp.FindStringSubmatch(line)
-		if m == nil {
+		account, ok, err := parseAttribute(acctRegexp, line)
+		if !ok {
 			continue
 		}
-		if m[1] != "" {
-			return m[1], nil
-		}
-		if m[2] == "" {
-			continue
-		}
-		decoded, err := hexDecode(m[2])
 		if err != nil {
 			return "", fmt.Errorf("malformed hex-encoded \"acct\" attribute: %w", err)
 		}
-		return decoded, nil
+		// An empty account is a value, not a failure: `security` renders it
+		// as `"acct"<blob>=""`, and git does not guarantee a non-empty
+		// username on a `store`, so cmd/gitcredential.go can create one.
+		return account, nil
 	}
 	return "", errors.New(`no "acct" attribute in security output`)
 }
@@ -235,37 +271,38 @@ func (k *Keychain) List() ([]string, error) {
 	if err != nil {
 		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %v", err)}
 	}
-	return parseKeychainDumpServices(out), nil
+	services, err := parseKeychainDumpServices(out)
+	if err != nil {
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %v", err)}
+	}
+	return services, nil
 }
 
 // parseKeychainDumpServices extracts the deduplicated, sorted set of service
 // names from `security dump-keychain` output, matching "svce" (generic
 // password) and "srvr" (internet password) attribute lines.
-func parseKeychainDumpServices(dump string) []string {
+//
+// An undecodable service name fails the whole enumeration rather than being
+// skipped. Silently omitting it would make `secret list` return a
+// complete-looking list with a service missing — no warning, no error, no
+// exit code — while `secret password <that-service>` still hands the
+// credential over. A truncated enumeration that looks whole is the one
+// failure this function must not produce, so it is reported as what it is:
+// output this package could not parse. (DedupeSortServices drops the empty
+// name, which is not addressable by any other command.)
+func parseKeychainDumpServices(dump string) ([]string, error) {
 	var names []string
 	for _, line := range strings.Split(dump, "\n") {
-		m := svceRegexp.FindStringSubmatch(line)
-		if m == nil {
+		name, ok, err := parseAttribute(svceRegexp, line)
+		if !ok {
 			continue
 		}
-
-		var name string
-		switch {
-		case m[1] != "":
-			name = m[1]
-		case m[2] != "":
-			decoded, err := hexDecode(m[2])
-			if err != nil {
-				continue
-			}
-			name = decoded
-		default:
-			continue
+		if err != nil {
+			return nil, fmt.Errorf("malformed hex-encoded service attribute: %w", err)
 		}
-
 		names = append(names, name)
 	}
-	return DedupeSortServices(names)
+	return DedupeSortServices(names), nil
 }
 
 // errItemNotFound is runSecurity's internal sentinel for a definitive "no
@@ -309,12 +346,22 @@ const itemNotFoundMessage = "could not be found in the keychain"
 // an error type.
 const securityLockedExitCode = 152
 
-// securityPasswordLine matches the `password: "..."` line `security
+// securityPasswordLine matches the `password:` line `security
 // find-generic-password -g` writes to stderr. Failure diagnostics interpolate
 // stderr, and cmd/gitcredential.go documents that no error path from this
 // package can carry a password value; redacting the line keeps that true even
 // if security ever printed a secret alongside a non-zero exit.
-var securityPasswordLine = regexp.MustCompile(`(?m)^password: ".*"$`)
+//
+// The whole line is matched rather than the quoted rendering alone, because
+// `-g` has more than one: a password it cannot render as text is printed as
+// `password: 0x<hex>  "<lossy>"`, which an anchored `^password: ".*"$` does
+// not match at all. Nothing else security prints starts with `password: ` —
+// its own diagnostics are prefixed `security: ` — so widening this costs no
+// diagnostic. One case remains outside a line-oriented pattern: a password
+// containing a newline puts its remainder on following lines that carry no
+// marker of what they are. This is defense in depth for a stream that is only
+// interpolated on failure, not the primary guarantee.
+var securityPasswordLine = regexp.MustCompile(`(?m)^password: .*$`)
 
 // runSecurity runs the security CLI with the given arguments, bounded by
 // k.timeout, and classifies the result: success returns stdout; a definitive
@@ -387,10 +434,10 @@ func securityFailureDetail(exitCode int, stderrMsg string, runErr error) string 
 	return detail
 }
 
-// redactPasswords replaces the value on any `password: "..."` line so that a
-// secret cannot reach an error string.
+// redactPasswords replaces the value on any `password:` line so that a secret
+// cannot reach an error string.
 func redactPasswords(s string) string {
-	return securityPasswordLine.ReplaceAllString(s, `password: "<redacted>"`)
+	return securityPasswordLine.ReplaceAllString(s, "password: <redacted>")
 }
 
 func (k *Keychain) findPassword(service string, passwordOnly bool) (string, error) {

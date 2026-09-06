@@ -39,7 +39,10 @@ attributes:
     "svce"<blob>="com.apple.assistant"
 `
 
-	got := parseKeychainDumpServices(dump)
+	got, err := parseKeychainDumpServices(dump)
+	if err != nil {
+		t.Fatalf("parseKeychainDumpServices() error = %v", err)
+	}
 	want := []string{"com.apple.assistant", "example.com"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseKeychainDumpServices() = %v, want %v", got, want)
@@ -53,7 +56,10 @@ func TestParseKeychainDumpServices_HexEncoded(t *testing.T) {
 attributes:
     "svce"<blob>=0x616263  "abc"
 `
-	got := parseKeychainDumpServices(dump)
+	got, err := parseKeychainDumpServices(dump)
+	if err != nil {
+		t.Fatalf("parseKeychainDumpServices() error = %v", err)
+	}
 	want := []string{"abc"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseKeychainDumpServices() = %v, want %v", got, want)
@@ -62,9 +68,35 @@ attributes:
 
 func TestParseKeychainDumpServices_Empty(t *testing.T) {
 	t.Parallel()
-	got := parseKeychainDumpServices("")
+	got, err := parseKeychainDumpServices("")
+	if err != nil {
+		t.Fatalf("parseKeychainDumpServices() error = %v", err)
+	}
 	if len(got) != 0 {
 		t.Errorf("parseKeychainDumpServices(\"\") = %v, want empty", got)
+	}
+}
+
+// TestParseKeychainDumpServices_MalformedHex pins issue #36's S3 in the
+// parser it was originally left out of: an undecodable service name must fail
+// the enumeration, not disappear from it. Skipping it would make `secret
+// list` omit a service that `secret password <service>` still resolves, with
+// nothing anywhere saying so.
+func TestParseKeychainDumpServices_MalformedHex(t *testing.T) {
+	t.Parallel()
+	dump := `class: "genp"
+attributes:
+    "svce"<blob>="visible"
+class: "genp"
+attributes:
+    "svce"<blob>=0x616
+`
+	got, err := parseKeychainDumpServices(dump)
+	if err == nil {
+		t.Fatalf("parseKeychainDumpServices() = %v, nil error; want a failure for an undecodable service name", got)
+	}
+	if got != nil {
+		t.Errorf("parseKeychainDumpServices() = %v on error, want no partial list", got)
 	}
 }
 
@@ -137,7 +169,15 @@ func newStandInKeychain(t *testing.T, timeout time.Duration, responses map[strin
 		}
 	}
 
+	// Every invocation records its full argument vector before answering, so
+	// that tests can assert *what was queried* and not only what came back.
+	// Without it the stand-in reads $1 and $2 and ignores the rest, and a
+	// query against the wrong service — or one that drops the keychain path
+	// and silently hits the user's default keychain search list — returns the
+	// same canned answer as the correct one.
 	script := "#!/bin/sh\n" +
+		"{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; " +
+		"printf '%s\\n' '" + standInArgvRecordEnd + "'; } >> '" + filepath.Join(dir, standInArgvLogName) + "'\n" +
 		"key=\"$1\"\n" +
 		"case \"$2\" in -g|-w) key=\"$1_$2\" ;; esac\n" +
 		"d='" + respDir + "'/\"$key\"\n" +
@@ -157,6 +197,68 @@ func newStandInKeychain(t *testing.T, timeout time.Duration, responses map[strin
 		keychainPath: filepath.Join(dir, "stand-in.keychain-db"),
 		security:     binary,
 		timeout:      timeout,
+	}
+}
+
+// standInArgvLogName is the file, beside the stand-in keychain path, in which
+// the stand-in records the argument vector of every invocation: one argument
+// per line, each invocation terminated by standInArgvRecordEnd. It is found
+// relative to Keychain.keychainPath rather than carried on the struct — that
+// is production code and gains nothing from a test-only field.
+//
+// An argument containing a newline would be recorded as two lines. No
+// argument this package passes can contain one (subcommands, flags, a service
+// name and a path), and the one caller that could — Add's -w password — is
+// supplied by the test itself.
+const standInArgvLogName = "argv.log"
+
+// standInArgvRecordEnd terminates one recorded invocation. It is not a string
+// any security invocation could pass as an argument.
+const standInArgvRecordEnd = "--end-of-argv--"
+
+// standInInvocations returns the argument vectors the stand-in has been
+// called with, in call order.
+func standInInvocations(t *testing.T, k *Keychain) [][]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(k.keychainPath), standInArgvLogName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read stand-in argv log: %v", err)
+	}
+
+	var invocations [][]string
+	var current []string
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if line == standInArgvRecordEnd {
+			invocations = append(invocations, current)
+			current = nil
+			continue
+		}
+		current = append(current, line)
+	}
+	if current != nil {
+		t.Fatalf("stand-in argv log ends mid-record: %q", current)
+	}
+	return invocations
+}
+
+// assertInvocations asserts the exact sequence of argument vectors the
+// stand-in was called with.
+//
+// Whole-argv equality rather than a spot check on the service name: it pins
+// the subcommand, the read flag, the -s/-a/-w arguments, the keychain path
+// and the order of the calls in a single assertion. Those are exactly what no
+// test constrained while the stand-in looked only at $1 and $2 — deleting the
+// wrong service, or querying the user's default keychain search list instead
+// of the configured keychain, produced identical canned output and passed
+// (issue #36 review, finding 2).
+func assertInvocations(t *testing.T, k *Keychain, want [][]string) {
+	t.Helper()
+	got := standInInvocations(t, k)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("security was invoked as\n\t%v\nwant\n\t%v", got, want)
 	}
 }
 
@@ -333,6 +435,31 @@ func TestGetUsername_MalformedHexAcct(t *testing.T) {
 	assertUnavailable(t, "GetUsername() on a malformed hex acct attribute", err)
 }
 
+// TestGetUsername_EmptyAccount covers an item whose account attribute is
+// present and empty — `"acct"<blob>=""`, which is what security prints for a
+// credential stored with no username. `git credential store` can create one:
+// cmd/gitcredential.go passes in.username through, and git does not guarantee
+// it is set.
+//
+// The lookup succeeded and the attribute parsed; the value is simply empty.
+// Reporting that as "could not read keychain item" made `secret login` exit 1
+// on an item that reads perfectly.
+func TestGetUsername_EmptyAccount(t *testing.T) {
+	t.Parallel()
+	dump := "class: \"genp\"\nattributes:\n    \"acct\"<blob>=\"\"\n    \"svce\"<blob>=\"example-service\"\n"
+	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+		"find-generic-password -g": {stdout: dump},
+	})
+
+	got, err := k.GetUsername("example-service")
+	if err != nil {
+		t.Fatalf("GetUsername() error = %v, want the empty account the item actually carries", err)
+	}
+	if got != "" {
+		t.Errorf("GetUsername() = %q, want the empty string", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Classification: not-found vs could-not-read, and the fallback semantics
 // ---------------------------------------------------------------------------
@@ -398,6 +525,49 @@ func TestGetPassword_FallsBackToInternetPassword(t *testing.T) {
 	if got != "from-internet" {
 		t.Errorf("GetPassword() = %q, want %q", got, "from-internet")
 	}
+}
+
+// TestFindPassword_QueriesTheRequestedService pins the argument vector of
+// both read legs: the subcommand, the flag that selects what security prints,
+// the service actually asked about, and the keychain the query is scoped to.
+//
+// The last of those is the one with teeth. Dropping k.keychainPath does not
+// fail: security then searches the user's default keychain search list, so
+// the backend would quietly answer from a keychain nobody configured — and
+// against a stand-in that ignores its arguments, every one of these mutations
+// returned the same canned answer and passed.
+func TestFindPassword_QueriesTheRequestedService(t *testing.T) {
+	t.Parallel()
+
+	t.Run("GetUsername asks for the attribute dump", func(t *testing.T) {
+		t.Parallel()
+		k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+			"find-generic-password -g": {stdout: attributeDump("alice")},
+		})
+
+		if _, err := k.GetUsername("example-service"); err != nil {
+			t.Fatalf("GetUsername() error = %v", err)
+		}
+		assertInvocations(t, k, [][]string{
+			{"find-generic-password", "-g", "-s", "example-service", k.keychainPath},
+		})
+	})
+
+	t.Run("GetPassword asks for the password alone, and falls back in the same keychain", func(t *testing.T) {
+		t.Parallel()
+		k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+			"find-generic-password -w":  {exitCode: secItemNotFoundExitCode},
+			"find-internet-password -w": {stdout: "from-internet\n"},
+		})
+
+		if _, err := k.GetPassword("example-service"); err != nil {
+			t.Fatalf("GetPassword() error = %v", err)
+		}
+		assertInvocations(t, k, [][]string{
+			{"find-generic-password", "-w", "-s", "example-service", k.keychainPath},
+			{"find-internet-password", "-w", "-s", "example-service", k.keychainPath},
+		})
+	})
 }
 
 // TestGetPassword_DoesNotFallBackAfterRealFailure pins the semantic PR #31
@@ -467,6 +637,35 @@ func TestGetUsername_DoesNotLeakPasswordIntoError(t *testing.T) {
 	}
 	if !strings.Contains(unavailable.Reason, "redacted") {
 		t.Errorf("ErrUnavailable.Reason = %q, want the password line redacted rather than dropped", unavailable.Reason)
+	}
+}
+
+// TestGetUsername_DoesNotLeakBinaryPasswordIntoError covers security's other
+// rendering of the same line: a password it cannot print as text arrives as
+// `password: 0x<hex>  "<lossy>"`, which an anchored `^password: ".*"$` does
+// not match at all. Both renderings must be redacted, and the diagnostic that
+// explains the failure must survive the redaction.
+func TestGetUsername_DoesNotLeakBinaryPasswordIntoError(t *testing.T) {
+	t.Parallel()
+	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+		"find-generic-password -g": {
+			exitCode: 1,
+			stderr:   "password: 0x68756E74657232  \"hunter2\"\nsecurity: something went wrong\n",
+		},
+	})
+
+	_, err := k.GetUsername("example-service")
+	unavailable := assertUnavailable(t, "GetUsername() against a failing -g invocation", err)
+	for _, leaked := range []string{"hunter2", "68756E74657232"} {
+		if strings.Contains(unavailable.Reason, leaked) {
+			t.Fatalf("ErrUnavailable.Reason leaked the password (%q): %q", leaked, unavailable.Reason)
+		}
+	}
+	if !strings.Contains(unavailable.Reason, "redacted") {
+		t.Errorf("ErrUnavailable.Reason = %q, want the password line redacted rather than dropped", unavailable.Reason)
+	}
+	if !strings.Contains(unavailable.Reason, "something went wrong") {
+		t.Errorf("ErrUnavailable.Reason = %q, want the diagnostic to survive redaction", unavailable.Reason)
 	}
 }
 
@@ -551,6 +750,90 @@ func TestDelete_MissingSecurityBinary(t *testing.T) {
 	assertUnavailable(t, "Delete() with a missing security binary", newMissingBinaryKeychain(t).Delete("example-service"))
 }
 
+// TestDelete_TargetsTheRequestedService is the destructive counterpart of
+// TestFindPassword_QueriesTheRequestedService, and the reason both exist: a
+// Delete that names the wrong service removes a credential the caller never
+// asked about, and the stand-in answered exit 0 to it just as happily as to
+// the right one.
+func TestDelete_TargetsTheRequestedService(t *testing.T) {
+	t.Parallel()
+	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+		"delete-generic-password":  {exitCode: secItemNotFoundExitCode},
+		"delete-internet-password": {exitCode: 0},
+	})
+
+	if err := k.Delete("example-service"); err != nil {
+		t.Fatalf("Delete() error = %v, want nil", err)
+	}
+	assertInvocations(t, k, [][]string{
+		{"delete-generic-password", "-s", "example-service", k.keychainPath},
+		{"delete-internet-password", "-s", "example-service", k.keychainPath},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Add
+// ---------------------------------------------------------------------------
+
+// TestAdd_GrantsAccessToTheRealSecurityBinary pins the one argument in this
+// file that must *not* follow the test seam. `-T /usr/bin/security` is the
+// non-interactive ACL grant that AGENTS.md records as the entire reason this
+// backend shells out to the security CLI instead of using cgo; passing
+// k.security there would make the ACL name whatever binary the tests
+// installed, and every subsequent read of that item would prompt.
+//
+// Add had no test at all, so both that and the -s/-a/-w vector were free to
+// change silently.
+func TestAdd_GrantsAccessToTheRealSecurityBinary(t *testing.T) {
+	t.Parallel()
+	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+		"add-generic-password": {exitCode: 0},
+	})
+	if k.security == securityBinary {
+		t.Fatal("the stand-in is the real security binary; this test cannot tell -T apart from the test seam")
+	}
+
+	if err := k.Add("example-service", "alice", "s3cr3t"); err != nil {
+		t.Fatalf("Add() error = %v, want nil", err)
+	}
+	assertInvocations(t, k, [][]string{
+		{"add-generic-password", "-s", "example-service", "-a", "alice", "-w", "s3cr3t", "-T", securityBinary, k.keychainPath},
+	})
+}
+
+// TestAdd_FailureIsUnavailable pins Add's error type. No caller does errors.As
+// on it today, so nothing breaks if it degrades to a bare fmt.Errorf — but
+// wincred.go and libsecret.go both return *ErrUnavailable from Add, and a
+// backend that quietly stops honouring the shared contract is found by the
+// first caller that starts relying on it.
+//
+// The absent-service subtest pins the other half: a write has no meaningful
+// "not found" outcome, so Add must not classify one even when security
+// reports a definitive miss.
+func TestAdd_FailureIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("locked keychain", func(t *testing.T) {
+		t.Parallel()
+		k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+			"add-generic-password": {exitCode: securityLockedExitCode},
+		})
+		assertUnavailable(t, "Add() against a locked keychain", k.Add("example-service", "alice", "s3cr3t"))
+	})
+
+	t.Run("definitive miss is still not *ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+		k := newStandInKeychain(t, standInTimeout, nil)
+		assertUnavailable(t, "Add() against a not-found exit", k.Add("example-service", "alice", "s3cr3t"))
+	})
+
+	t.Run("missing security binary", func(t *testing.T) {
+		t.Parallel()
+		k := newMissingBinaryKeychain(t)
+		assertUnavailable(t, "Add() with a missing security binary", k.Add("example-service", "alice", "s3cr3t"))
+	})
+}
+
 // ---------------------------------------------------------------------------
 // IsAvailable
 // ---------------------------------------------------------------------------
@@ -628,6 +911,23 @@ func TestList_FailureIsUnavailable(t *testing.T) {
 
 	_, err := k.List()
 	assertUnavailable(t, "List() against a locked keychain", err)
+}
+
+// TestList_MalformedServiceNameIsUnavailable is
+// TestParseKeychainDumpServices_MalformedHex through the backend: an
+// enumeration this package cannot fully parse is reported as unavailable, not
+// returned as a shorter list that looks complete.
+func TestList_MalformedServiceNameIsUnavailable(t *testing.T) {
+	t.Parallel()
+	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
+		"dump-keychain": {stdout: "class: \"genp\"\nattributes:\n    \"svce\"<blob>=\"visible\"\nclass: \"genp\"\nattributes:\n    \"svce\"<blob>=0x616\n"},
+	})
+
+	services, err := k.List()
+	assertUnavailable(t, "List() against an undecodable service name", err)
+	if services != nil {
+		t.Errorf("List() = %v alongside an error, want no partially-parsed list", services)
+	}
 }
 
 // ---------------------------------------------------------------------------
