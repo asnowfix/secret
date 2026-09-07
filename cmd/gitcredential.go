@@ -272,14 +272,27 @@ func gitCredentialStore(b backend.Backend, in gitCredentialInput, stderr io.Writ
 // gitCredentialErase removes a stored credential git has determined is
 // wrong. If the request carries a username and it does not match what is
 // currently stored, the credential is left alone — it is not the one git is
-// asking to erase.
+// asking to erase. If the request carries a username and the stored one
+// cannot be read at all, the erase is refused rather than guessed at: see
+// classifyEraseTarget.
 func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writer) {
 	service := gitCredentialServiceKey(in)
 	if service == "" {
 		return
 	}
 	if in.username != "" {
-		if current, err := b.GetUsername(service); err == nil && current != in.username {
+		current, err := b.GetUsername(service)
+		proceed, indeterminate := classifyEraseTarget(in.username, current, err)
+		if indeterminate != nil {
+			// A fixed, backend-authored diagnostic string, never a
+			// credential value — same reasoning as the ErrUnavailable case
+			// documented on gitCredentialGet. git ignores an erase's output
+			// (gitcredentials(7)), so this is for a human wondering why the
+			// credential is still there.
+			fmt.Fprintf(stderr, "git-credential-secret: could not determine which username is stored for '%s', refusing to erase a credential that may not be the one git asked about: %v\n", service, indeterminate)
+			return
+		}
+		if !proceed {
 			return
 		}
 	}
@@ -289,4 +302,46 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 			fmt.Fprintf(stderr, "git-credential-secret: failed to erase credential for '%s': %v\n", service, err)
 		}
 	}
+}
+
+// classifyEraseTarget decides whether an erase request that named a
+// username may delete the stored credential for that service, given the
+// username currently stored (current) and the error GetUsername returned
+// while reading it.
+//
+// It is the erase-side counterpart of classifySetTarget (cmd/set.go) and
+// exists for the same reason: a failed read is not an answer. GetUsername
+// can fail on any backend for reasons that say nothing about who is stored
+// — a keychain re-locked between this helper's IsAvailable check and this
+// call, a stale D-Bus session, a transport fault, a timeout — while Delete
+// still succeeds afterwards. Letting the delete run in that case means an
+// erase naming bob destroys alice's credential, so only a definitive answer
+// authorises it:
+//
+//   - read succeeded: proceed only on an exact match, as before.
+//   - *backend.ErrNotFound: definitive, and there is nothing to lose.
+//     The delete is still allowed, so an erase behaves the same as the
+//     no-username case on a backend whose GetUsername and Delete disagree
+//     about what is stored; if the credential really is absent, Delete's
+//     own ErrNotFound is swallowed as the normal outcome it is.
+//   - anything else: indeterminate, handed back for the caller to refuse
+//     on rather than guessed at.
+//
+// Refusing has a cost of its own — git cannot clear a credential it knows
+// is bad, so it may keep retrying against the stale one — but that is
+// transient, visible on stderr and user-recoverable (retry once the store
+// is readable, or `secret delete <service>` by hand), whereas erasing
+// another user's credential is silent and irreversible. The trade is only
+// ever made when git supplied a username to narrow by; an erase that names
+// no username is asking for whatever is stored under that service and is
+// unaffected by this.
+func classifyEraseTarget(want, current string, err error) (proceed bool, indeterminate error) {
+	if err == nil {
+		return current == want, nil
+	}
+	var notFound *backend.ErrNotFound
+	if errors.As(err, &notFound) {
+		return true, nil
+	}
+	return false, err
 }
