@@ -1131,3 +1131,19 @@ func lockScratchKeychain(t *testing.T, path string) {
 		t.Fatalf("lock-keychain %s: %v: %s", path, err, out)
 	}
 }
+
+// TestSecurityBoundsRespectCap pins the /usr/bin/security bounds under the
+// hard ceiling from timeouts.go.
+//
+// The two are summed rather than checked separately because that is how they
+// compose in runSecurity: on a timeout it kills the process and then waits up
+// to securityWaitDelay for the inherited pipes to close, so the worst case a
+// caller can observe is the sum. Checking them individually would let the pair
+// drift back over the cap while each half still looked compliant.
+func TestSecurityBoundsRespectCap(t *testing.T) {
+	t.Parallel()
+	if worst := securityCommandTimeout + securityWaitDelay; worst > maxExternalCallTimeout {
+		t.Errorf("securityCommandTimeout (%s) + securityWaitDelay (%s) = %s, exceeds maxExternalCallTimeout (%s)",
+			securityCommandTimeout, securityWaitDelay, worst, maxExternalCallTimeout)
+	}
+}

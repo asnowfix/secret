@@ -124,7 +124,8 @@ func isOwnItem(attrs map[string]string) bool {
 // Secret Service unlock/create prompt (e.g. a GUI "unlock your keyring"
 // dialog) before giving up. It is deliberately much longer than
 // dbusCallTimeout below because a human, not the provider, is on the other
-// end of it.
+// end of it. That is also why it is exempt from maxExternalCallTimeout
+// (timeouts.go): the cap bounds waits on machines, not waits on people.
 const promptWaitTimeout = 2 * time.Minute
 
 // dbusCallTimeout bounds every other D-Bus round trip this backend makes
@@ -134,11 +135,26 @@ const promptWaitTimeout = 2 * time.Minute
 // registered on the bus but wedged — or a bus that never replies — would
 // hang the call forever. Because PersistentPreRunE (cmd/root.go) calls
 // IsAvailable() before every subcommand, an unbounded connect() alone would
-// hang the entire CLI with no output. 10s is generous for a local,
-// per-user D-Bus socket talking to a provider that is actually alive, while
-// still bounded enough to fail fast and produce an actionable
-// *ErrUnavailable when it is not.
-const dbusCallTimeout = 10 * time.Second
+// hang the entire CLI with no output. It is generous for a local, per-user
+// D-Bus socket talking to a provider that is actually alive, while still
+// bounded enough to fail fast and produce an actionable *ErrUnavailable
+// when it is not.
+//
+// The value comes from externalCallTimeout (timeouts.go). Unlike the macOS
+// call sites it was not derived from measurements of this backend: nobody
+// on this project has a Linux desktop (the only thing that exercises this
+// code against a real Secret Service provider is the headless
+// dbus-run-session recipe in .github/workflows/ci.yml), so there is no
+// working response time on record to take 2x of. What the shared floor
+// gives it is compliance with maxExternalCallTimeout, which 10s was not.
+// If Linux measurements ever become available and argue for a different
+// per-site value, this is the constant to split out — and the thing to
+// measure is *activation* latency, not round-trip latency. A warm provider
+// answers in microseconds; a cold one has to be D-Bus-activated first, which
+// is plausibly multi-second on a loaded desktop and is the only case where 5s
+// could be tight. CI's dbus-run-session recipe starts the daemon up front, so
+// it never exercises that path.
+const dbusCallTimeout = externalCallTimeout
 
 // callCtx returns a context bounded by dbusCallTimeout, for use with
 // CallWithContext on every D-Bus method call except the prompt wait (which
