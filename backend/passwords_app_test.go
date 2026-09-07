@@ -4,7 +4,13 @@ package backend
 
 import (
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -136,5 +142,189 @@ func TestPasswordsApp_GetPassword_NotFound(t *testing.T) {
 	var notFound *ErrNotFound
 	if !errors.As(err, &notFound) {
 		t.Fatalf("GetPassword() error = %v (%T), want *ErrNotFound", err, err)
+	}
+}
+
+// TestQueriesRefuseKeychainUI checks the first of the two levers behind the
+// #37 fix: that the single dictionary-construction path every SecItem* call
+// in passwords_app.go goes through carries
+// kSecUseAuthenticationUI = kSecUseAuthenticationUIFail.
+//
+// It asks CoreFoundation what is actually in the dictionary rather than
+// re-stating the source, so removing the key from _no_ui_dict fails here.
+// No keychain is touched, so unlike the live tests below this runs
+// everywhere.
+func TestQueriesRefuseKeychainUI(t *testing.T) {
+	t.Parallel()
+	if !queriesRefuseKeychainUI() {
+		t.Error("queries built by _no_ui_dict do not set kSecUseAuthenticationUI=kSecUseAuthenticationUIFail; " +
+			"a SecItem* call on the Data Protection keychain is free to block on an unlock dialog again (#37)")
+	}
+}
+
+// TestRefuseKeychainUIDisablesLegacyKeychainUI checks the second lever:
+// SecKeychainSetUserInteractionAllowed(FALSE), which is the only thing that
+// covers the legacy file-backed keychain — the one this backend actually
+// writes to, and the source of the #44 ACL dialog. SecItem.h is explicit
+// that the dictionary key above does not reach legacy items, so the two are
+// not interchangeable and both are checked.
+//
+// This reads back process state from the Security framework; it opens no
+// keychain and stores nothing.
+func TestRefuseKeychainUIDisablesLegacyKeychainUI(t *testing.T) {
+	refuseKeychainUI()
+	allowed, answered := keychainUIAllowed()
+	if !answered {
+		t.Skip("SecKeychainGetUserInteractionAllowed did not answer on this host")
+	}
+	if allowed {
+		t.Error("keychain user interaction is still allowed after refuseKeychainUI(); " +
+			"a legacy-keychain SecItem* call can still block on an unlock or ACL dialog (#37, #44)")
+	}
+}
+
+// TestEveryKeychainEntryPointRefusesUI is the guard against the way this fix
+// is most likely to be undone: not by deleting refuseKeychainUI, but by
+// adding a sixth PasswordsApp method that reaches the Security framework and
+// forgetting to call it. That method would be unbounded again, silently, and
+// no behavioural test would notice unless it happened to run against a
+// locked keychain.
+//
+// So this reads passwords_app.go itself and requires every *PasswordsApp
+// method whose body calls into the C preamble to call refuseKeychainUI()
+// first. It is a structural assertion because the property being asserted is
+// structural: the underlying framework switch is process-global and set
+// once, so no runtime state distinguishes "this method called it" from "some
+// earlier method did".
+func TestEveryKeychainEntryPointRefusesUI(t *testing.T) {
+	t.Parallel()
+
+	const src = "passwords_app.go"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", src, err)
+	}
+
+	checked := 0
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || fn.Body == nil || !isPasswordsAppReceiver(fn.Recv) {
+			continue
+		}
+		if !callsSecurityFramework(fn.Body) {
+			continue
+		}
+		checked++
+		if !refusesUIFirst(fn.Body) {
+			t.Errorf("(*PasswordsApp).%s reaches the Security framework but does not call refuseKeychainUI() first; "+
+				"that call is unbounded and can block on a keychain dialog forever (#37)", fn.Name.Name)
+		}
+	}
+
+	// A refactor that renamed the receiver or moved the C calls behind a
+	// Go-side helper would otherwise leave this test passing while checking
+	// nothing at all.
+	if checked < 5 {
+		t.Errorf("found only %d *PasswordsApp methods calling into the Security framework, want at least 5 "+
+			"(GetPassword, GetUsername, Add, Delete, List); this test is no longer looking at what it thinks it is", checked)
+	}
+}
+
+func isPasswordsAppReceiver(recv *ast.FieldList) bool {
+	if len(recv.List) != 1 {
+		return false
+	}
+	star, ok := recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := star.X.(*ast.Ident)
+	return ok && ident.Name == "PasswordsApp"
+}
+
+// callsSecurityFramework reports whether body contains a call to one of the
+// C helpers in this file's preamble that reaches SecItem*/SecKeychain*. The
+// sec_ prefix is the naming convention every such helper follows; C.CString
+// and C.free are deliberately not matched, because they are plain libc and
+// block on nothing.
+func callsSecurityFramework(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg.Name != "C" {
+			return true
+		}
+		if strings.HasPrefix(sel.Sel.Name, "sec_") {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+func refusesUIFirst(body *ast.BlockStmt) bool {
+	if len(body.List) == 0 {
+		return false
+	}
+	expr, ok := body.List[0].(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := expr.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	return ok && ident.Name == "refuseKeychainUI"
+}
+
+// TestPasswordsApp_RoundTrip_Live is the regression guard for the other half
+// of the #37 change: refusing UI must not break the calls that were working.
+// kSecUseAuthenticationUI is an extra key in every query and attribute
+// dictionary, including the one handed to SecItemAdd, and an argument macOS
+// rejected would turn every operation into errSecParam. Nothing else in the
+// suite would catch that, because nothing else calls the real framework.
+//
+// Opt-in for the same reason as TestPasswordsApp_GetPassword_NotFound: it
+// writes to, reads from and deletes from the runner's own default keychain.
+func TestPasswordsApp_RoundTrip_Live(t *testing.T) {
+	if os.Getenv("SECRET_LIVE_KEYCHAIN_TEST") != "1" {
+		t.Skip("set SECRET_LIVE_KEYCHAIN_TEST=1 to write to the runner's real default keychain")
+	}
+	p := NewPasswordsApp()
+	service := fmt.Sprintf("secret-issue37-roundtrip-%d", os.Getpid())
+
+	if err := p.Add(service, "issue37", "issue37-password"); err != nil {
+		t.Fatalf("Add() error = %v; refusing keychain UI must not break a working write", err)
+	}
+	t.Cleanup(func() {
+		if err := p.Delete(service); err != nil {
+			var notFound *ErrNotFound
+			if !errors.As(err, &notFound) {
+				t.Errorf("cleanup Delete(%q) error = %v; the test item may still be in the keychain", service, err)
+			}
+		}
+		if _, err := p.GetPassword(service); err == nil {
+			t.Errorf("cleanup left %q readable in the keychain", service)
+		}
+	})
+
+	if got, err := p.GetPassword(service); err != nil || got != "issue37-password" {
+		t.Errorf("GetPassword() = %q, %v; want %q, <nil>", got, err, "issue37-password")
+	}
+	if got, err := p.GetUsername(service); err != nil || got != "issue37" {
+		t.Errorf("GetUsername() = %q, %v; want %q, <nil>", got, err, "issue37")
+	}
+	services, err := p.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if !slices.Contains(services, service) {
+		t.Errorf("List() did not contain %q", service)
 	}
 }

@@ -9,6 +9,109 @@ package backend
 #include <stdlib.h>
 #include <string.h>
 
+// ---------------------------------------------------------------------------
+// Refusing keychain UI (issue #37)
+//
+// Every SecItem* call below is synchronous cgo. Unlike the /usr/bin/security
+// subprocess (keychain.go) and the D-Bus round trips (libsecret.go), there is
+// nothing here a context can cancel: no child process to kill, and the
+// calling goroutine is pinned to its OS thread for the duration. So the only
+// way to bound these calls is to remove the reason they block, which in every
+// reported case is a GUI dialog nobody is there to answer — a keychain-unlock
+// prompt, or the ACL authorization dialog raised when the reading executable
+// is not the one that created the item (issue #44).
+//
+// macOS needs both levers below, because it has two keychain implementations
+// and each ignores the other's:
+//
+//   1. kSecUseAuthenticationUI = kSecUseAuthenticationUIFail in every query
+//      and attribute dictionary. This covers the Data Protection keychain —
+//      iCloud-synced items, i.e. exactly what Passwords.app manages and what
+//      kSecAttrSynchronizableAny brings into these queries. SecItem.h is
+//      explicit that this is all it covers: "on macOS, this attribute only
+//      applies to items stored in the Data Protection keychain. Legacy
+//      keychain items will still activate UI if needed."
+//
+//   2. SecKeychainSetUserInteractionAllowed(FALSE). This covers the legacy
+//      file-backed keychain (login.keychain-db) — which is where
+//      sec_add_generic_password actually writes, and where the #44 ACL dialog
+//      comes from. It is the only lever for that path.
+//
+// Both make the call return errSecInteractionNotAllowed (-25308) instead of
+// waiting. classifyPasswordsAppLookup and isRealFailure already route that to
+// *ErrUnavailable, so the caller gets an actionable error rather than a hang.
+//
+// Apple's suggested replacement for kSecUseAuthenticationUIFail is
+// kSecUseAuthenticationContext with LAContext.interactionNotAllowed, which
+// governs LocalAuthentication (Touch ID / password re-auth) and not the
+// keychain-unlock or ACL dialogs that hang here; and there is no replacement
+// at all for SecKeychainSetUserInteractionAllowed. Both are therefore used
+// deliberately in their deprecated form, with the warning suppressed over the
+// smallest region that needs it.
+// ---------------------------------------------------------------------------
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+// sec_refuse_user_interaction turns off keychain UI for this process, so that
+// a legacy-keychain call which would otherwise put up an unlock or ACL dialog
+// fails with errSecInteractionNotAllowed instead. Process-global by
+// construction — there is no per-call form of it — and never restored: see
+// refuseKeychainUI on the Go side for why that is the intended scope here.
+static OSStatus sec_refuse_user_interaction(void) {
+	return SecKeychainSetUserInteractionAllowed(FALSE);
+}
+
+// sec_user_interaction_allowed reports the process-global state above, so a
+// test can assert it was actually applied rather than assume it.
+static OSStatus sec_user_interaction_allowed(int *allowed) {
+	Boolean state = TRUE;
+	OSStatus st = SecKeychainGetUserInteractionAllowed(&state);
+	*allowed = state ? 1 : 0;
+	return st;
+}
+
+// _no_ui_dict builds the CFDictionary for a SecItem* call from n key/value
+// pairs, always appending kSecUseAuthenticationUI = kSecUseAuthenticationUIFail.
+//
+// Every dictionary in this file is created here rather than by calling
+// CFDictionaryCreate directly, so that "refuse UI" cannot be forgotten at one
+// of the seven call sites. That is not hypothetical tidiness: the defect this
+// function exists to fix was precisely that none of them set it.
+//
+// Every caller passes a literal n of 5 or fewer, so the NULL return for an
+// oversized n is unreachable today; it is there so that a future caller that
+// does exceed the buffer fails on a NULL dictionary rather than silently
+// smashing the stack.
+#define _NO_UI_DICT_MAX 8
+static CFDictionaryRef _no_ui_dict(const void **k, const void **v, CFIndex n) {
+	const void *ks[_NO_UI_DICT_MAX + 1];
+	const void *vs[_NO_UI_DICT_MAX + 1];
+	if (n > _NO_UI_DICT_MAX) return NULL;
+	for (CFIndex i = 0; i < n; i++) { ks[i] = k[i]; vs[i] = v[i]; }
+	ks[n] = kSecUseAuthenticationUI;
+	vs[n] = kSecUseAuthenticationUIFail;
+	return CFDictionaryCreate(NULL, ks, vs, n + 1,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+}
+
+// sec_dict_refuses_ui reports whether a dictionary built by _no_ui_dict
+// carries the refuse-UI key. It exists for the test: cgo constants are not
+// reachable from _test.go files, so this is how Go-side tests check the one
+// construction path every query goes through.
+static int sec_dict_refuses_ui(void) {
+	const void *k[] = {kSecClass};
+	const void *v[] = {kSecClassGenericPassword};
+	CFDictionaryRef q = _no_ui_dict(k, v, 1);
+	if (!q) return 0;
+	CFTypeRef ui = CFDictionaryGetValue(q, kSecUseAuthenticationUI);
+	int ok = (ui != NULL) && CFEqual(ui, kSecUseAuthenticationUIFail);
+	CFRelease(q);
+	return ok;
+}
+
+#pragma clang diagnostic pop
+
 // _cfdata_to_cstr copies CFDataRef bytes into a malloc'd, null-terminated string.
 static char* _cfdata_to_cstr(CFDataRef d) {
 	CFIndex n = CFDataGetLength(d);
@@ -51,8 +154,7 @@ static char* sec_copy_password(const char *name, OSStatus *stGeneric, OSStatus *
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecReturnData, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
 		CFTypeRef r = NULL;
 		*stGeneric = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -66,8 +168,7 @@ static char* sec_copy_password(const char *name, OSStatus *stGeneric, OSStatus *
 	{
 		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnData, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
 		CFTypeRef r = NULL;
 		*stInternet = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -96,8 +197,7 @@ static char* sec_copy_username(const char *name, OSStatus *stGeneric, OSStatus *
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
 		CFTypeRef r = NULL;
 		*stGeneric = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -112,8 +212,7 @@ static char* sec_copy_username(const char *name, OSStatus *stGeneric, OSStatus *
 	{
 		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitOne, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 5,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
 		CFTypeRef r = NULL;
 		*stInternet = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -136,8 +235,7 @@ static OSStatus sec_add_generic_password(const char *service, const char *accoun
 	CFDataRef   data = CFDataCreate(NULL, (const UInt8*)password, strlen(password));
 	const void *k[] = {kSecClass, kSecAttrService, kSecAttrAccount, kSecValueData};
 	const void *v[] = {kSecClassGenericPassword, svc, acct, data};
-	CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 4,
-		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionaryRef attrs = _no_ui_dict(k, v, 4);
 	OSStatus st = SecItemAdd(attrs, NULL);
 	CFRelease(attrs); CFRelease(data); CFRelease(acct); CFRelease(svc);
 	return st;
@@ -160,8 +258,7 @@ static char* sec_copy_all_services(OSStatus *stGeneric, OSStatus *stInternet) {
 	{
 		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassGenericPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 4);
 		CFTypeRef r = NULL;
 		*stGeneric = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -184,8 +281,7 @@ static char* sec_copy_all_services(OSStatus *stGeneric, OSStatus *stInternet) {
 	{
 		const void *k[] = {kSecClass, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassInternetPassword, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 4);
 		CFTypeRef r = NULL;
 		*stInternet = SecItemCopyMatching(q, &r);
 		CFRelease(q);
@@ -224,8 +320,7 @@ static OSStatus sec_delete_item(const char *name) {
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassGenericPassword, n, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 3,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 3);
 		st = SecItemDelete(q);
 		CFRelease(q);
 		if (st == errSecSuccess) { CFRelease(n); return st; }
@@ -234,8 +329,7 @@ static OSStatus sec_delete_item(const char *name) {
 	{
 		const void *k[] = {kSecClass, kSecAttrServer, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassInternetPassword, n, kSecAttrSynchronizableAny};
-		CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 3,
-			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFDictionaryRef q = _no_ui_dict(k, v, 3);
 		st = SecItemDelete(q);
 		CFRelease(q);
 	}
@@ -251,6 +345,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -260,6 +355,59 @@ import (
 type PasswordsApp struct{}
 
 func NewPasswordsApp() *PasswordsApp { return &PasswordsApp{} }
+
+// refuseKeychainUIOnce guards the one-time, process-global
+// SecKeychainSetUserInteractionAllowed(FALSE) that stops legacy-keychain
+// calls from putting up an unlock or ACL dialog (issue #37; see the C
+// preamble for why this and kSecUseAuthenticationUIFail are both needed).
+var refuseKeychainUIOnce sync.Once
+
+// refuseKeychainUI turns off keychain UI for this process. Every method that
+// reaches the Security framework calls it first, rather than doing it in
+// NewPasswordsApp, so that it holds for a PasswordsApp built any other way
+// (tests construct one directly) and so the invariant lives next to the calls
+// that depend on it.
+//
+// Three properties are deliberate and worth stating plainly, because they are
+// what a reviewer would otherwise have to reverse-engineer:
+//
+//   - It is process-global. The Security framework offers no per-call form.
+//     For this project that scope is the intent rather than a compromise:
+//     secret and git-credential-secret are non-interactive credential tools,
+//     run from shells, git, cron and CI, and a modal keychain dialog in any
+//     of those contexts is the defect, not a feature.
+//   - It is never restored. There is no point in the CLI's life where it
+//     would want the dialog back; restoring it around each call would also
+//     race with any concurrent caller and reopen the hole for the duration.
+//   - Its failure is deliberately ignored. If the call fails, the worst case
+//     is exactly today's behaviour on the legacy path, and the
+//     kSecUseAuthenticationUIFail key still covers the Data Protection path;
+//     refusing to run at all would be a strictly worse trade.
+func refuseKeychainUI() {
+	refuseKeychainUIOnce.Do(func() { C.sec_refuse_user_interaction() })
+}
+
+// keychainUIAllowed reports the process-global keychain-UI state that
+// refuseKeychainUI turns off, and whether the framework answered at all.
+//
+// queriesRefuseKeychainUI reports whether _no_ui_dict — the single
+// construction path behind every SecItem* call in this file — sets the
+// refuse-UI key.
+//
+// Both exist only so the tests can check the two levers of the #37 fix
+// against the framework rather than against a restatement of the code. They
+// live here, next to the cgo they wrap, for the same reason
+// secSuccessStatus does: cgo is not available in _test.go files, so a test
+// that needs a C value or a C call needs a Go-side wrapper in this file.
+func keychainUIAllowed() (allowed, answered bool) {
+	var a C.int
+	st := C.sec_user_interaction_allowed(&a)
+	return a != 0, int32(st) == secSuccessStatus
+}
+
+func queriesRefuseKeychainUI() bool {
+	return C.sec_dict_refuses_ui() != 0
+}
 
 func (p *PasswordsApp) IsAvailable() error {
 	if _, err := os.Stat("/System/Applications/Passwords.app"); err != nil {
@@ -298,6 +446,7 @@ func classifyPasswordsAppLookup(service string, stGeneric, stInternet int32) err
 }
 
 func (p *PasswordsApp) GetPassword(service string) (string, error) {
+	refuseKeychainUI()
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
 	var stGeneric, stInternet C.OSStatus
@@ -310,6 +459,7 @@ func (p *PasswordsApp) GetPassword(service string) (string, error) {
 }
 
 func (p *PasswordsApp) GetUsername(service string) (string, error) {
+	refuseKeychainUI()
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
 	var stGeneric, stInternet C.OSStatus
@@ -322,6 +472,7 @@ func (p *PasswordsApp) GetUsername(service string) (string, error) {
 }
 
 func (p *PasswordsApp) Add(service, account, password string) error {
+	refuseKeychainUI()
 	svc := C.CString(service)
 	acct := C.CString(account)
 	pw := C.CString(password)
@@ -335,6 +486,7 @@ func (p *PasswordsApp) Add(service, account, password string) error {
 }
 
 func (p *PasswordsApp) Delete(service string) error {
+	refuseKeychainUI()
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
 	st := C.sec_delete_item(svc)
@@ -363,6 +515,7 @@ func (p *PasswordsApp) Edit() error {
 // result would reintroduce the same "denied looks like empty" problem this
 // method exists to avoid, just for half the store instead of all of it.
 func (p *PasswordsApp) List() ([]string, error) {
+	refuseKeychainUI()
 	var stGeneric, stInternet C.OSStatus
 	raw := C.sec_copy_all_services(&stGeneric, &stInternet)
 	defer func() {
