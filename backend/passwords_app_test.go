@@ -475,21 +475,95 @@ func TestInteractionRefusedNoteExplainsTheStatusThisPackageCreates(t *testing.T)
 // having silently failed would look exactly like the residual risk this
 // design knowingly accepts (a wedged securityd).
 func TestRefuseKeychainUINoteReportsALatchedFailure(t *testing.T) {
-	// Not parallel: it swaps a package-level variable.
-	saved := refuseKeychainUIStatus
-	t.Cleanup(func() { refuseKeychainUIStatus = saved })
+	// Not parallel: it swaps package-level state.
+	saved := refuseKeychainUIResult
+	t.Cleanup(func() { refuseKeychainUIResult = saved })
 
-	refuseKeychainUIStatus = secSuccessStatus
+	// The wiring: refuseKeychainUI must actually record what the lever
+	// returned. Checking status alone could not prove this — the zero value
+	// of an OSStatus is errSecSuccess, so "recorded a success" and "recorded
+	// nothing" are the same int32. attempted is what distinguishes them, and
+	// what fails if the Once body stops recording.
+	//
+	// attempted is deliberately not cleared first: the sync.Once may already
+	// have fired in an earlier test in this binary, and clearing it would
+	// make this assertion depend on test order. Either this call records, or
+	// the earlier one did; if nothing records, nothing ever sets it.
+	refuseKeychainUI()
+	if !refuseKeychainUIResult.attempted {
+		t.Error("refuseKeychainUI() did not record the lever's OSStatus; " +
+			"a silently failed lever would then be indistinguishable from a wedged securityd")
+	}
+
+	refuseKeychainUIResult.attempted = true
+	refuseKeychainUIResult.status = secSuccessStatus
 	if note := refuseKeychainUINote(); note != "" {
 		t.Errorf("refuseKeychainUINote() = %q on success, want empty", note)
 	}
 
-	refuseKeychainUIStatus = errSecInteractionNotAllowed
+	refuseKeychainUIResult.status = errSecInteractionNotAllowed
 	note := refuseKeychainUINote()
 	if !strings.Contains(note, "SecKeychainSetUserInteractionAllowed") {
 		t.Errorf("refuseKeychainUINote() = %q, want it to name the lever that failed", note)
 	}
 	if !strings.Contains(note, strconv.Itoa(errSecInteractionNotAllowed)) {
 		t.Errorf("refuseKeychainUINote() = %q, want it to carry the status %d", note, errSecInteractionNotAllowed)
+	}
+}
+
+// TestPasswordsAppMethodsReturnTypedErrors requires every *PasswordsApp
+// method to build its errors from the Backend error types, never from a bare
+// fmt.Errorf.
+//
+// It is structural because the property cannot be driven at runtime: making
+// List or Add fail needs a keychain that fails on demand, and there is no way
+// to arrange one here. The convention is real though — Keychain.Add and
+// Keychain.List both return *ErrUnavailable, classifyBusError and
+// classifyCredError do the same on the other platforms — and this backend had
+// silently drifted off it on three of five entry points while a comment
+// claimed otherwise. A test that reads the source is a weaker instrument than
+// one that reads behaviour, but it is the one that fits the gap, and it fails
+// loudly if it stops inspecting anything.
+func TestPasswordsAppMethodsReturnTypedErrors(t *testing.T) {
+	t.Parallel()
+
+	const src = "passwords_app.go"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", src, err)
+	}
+
+	checked := 0
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || fn.Body == nil || !isPasswordsAppReceiver(fn.Recv) {
+			continue
+		}
+		checked++
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "fmt" || sel.Sel.Name != "Errorf" {
+				return true
+			}
+			t.Errorf("(*PasswordsApp).%s builds an error with fmt.Errorf; callers cannot test for it "+
+				"with errors.As, and the convention here (Keychain.Add, Keychain.List) is *ErrUnavailable",
+				fn.Name.Name)
+			return true
+		})
+	}
+
+	if checked < 7 {
+		t.Errorf("inspected only %d *PasswordsApp methods, want all 7 "+
+			"(IsAvailable, GetPassword, GetUsername, Add, Delete, Edit, List); "+
+			"this test is no longer looking at what it thinks it is", checked)
 	}
 }

@@ -388,9 +388,18 @@ func NewPasswordsApp() *PasswordsApp { return &PasswordsApp{} }
 // silently failed would be indistinguishable from the residual risk this
 // design does knowingly accept (a wedged securityd) — and the whole point of
 // the #37 fix is that a caller can tell what happened to it.
+//
+// attempted is tracked separately rather than inferred from status, because
+// the zero value of an OSStatus *is* errSecSuccess: "the lever succeeded" and
+// "the lever was never run, and nothing recorded anything" would otherwise be
+// the same value, which is exactly the confusion this variable exists to
+// remove.
 var (
 	refuseKeychainUIOnce   sync.Once
-	refuseKeychainUIStatus int32
+	refuseKeychainUIResult struct {
+		attempted bool
+		status    int32
+	}
 )
 
 // refuseKeychainUI turns off keychain UI for this process. Every method that
@@ -414,27 +423,29 @@ var (
 //     If the call fails, the worst case is exactly the pre-#37 behaviour on
 //     the legacy path and kSecUseAuthenticationUIFail still covers the Data
 //     Protection path, so refusing to run at all would be a strictly worse
-//     trade. It is recorded in refuseKeychainUIStatus and appended to
+//     trade. It is recorded in refuseKeychainUIResult and appended to
 //     whatever error the operation goes on to produce, so a lever that
 //     silently failed is visible in the diagnostic rather than only in the
 //     symptom.
 func refuseKeychainUI() {
 	refuseKeychainUIOnce.Do(func() {
-		refuseKeychainUIStatus = int32(C.sec_refuse_user_interaction())
+		refuseKeychainUIResult.status = int32(C.sec_refuse_user_interaction())
+		refuseKeychainUIResult.attempted = true
 	})
 }
 
 // refuseKeychainUINote reports that the UI-refusal lever itself failed, for
 // appending to an error message. Empty in the normal case, which is every
-// case observed so far.
+// case observed so far, and empty before the lever has been run at all —
+// every path that can produce an error runs it first.
 func refuseKeychainUINote() string {
-	if refuseKeychainUIStatus == secSuccessStatus {
+	if !refuseKeychainUIResult.attempted || refuseKeychainUIResult.status == secSuccessStatus {
 		return ""
 	}
 	return fmt.Sprintf(
 		" (note: SecKeychainSetUserInteractionAllowed failed with Security error %d,"+
 			" so legacy-keychain calls in this process may still be waiting on a dialog)",
-		refuseKeychainUIStatus)
+		refuseKeychainUIResult.status)
 }
 
 // keychainUIAllowed reports the process-global keychain-UI state that
