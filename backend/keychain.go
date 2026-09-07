@@ -36,7 +36,7 @@ const securityBinary = "/usr/bin/security"
 // measurements it was derived from and the reasoning for the floor applied
 // to them. Note the effective worst case is this plus securityWaitDelay
 // below; both together must stay under maxExternalCallTimeout, which
-// TestExternalCallBoundsRespectCap asserts.
+// TestSecurityBoundsRespectCap asserts.
 const securityCommandTimeout = externalCallTimeout
 
 // securityWaitDelay is how long runSecurity waits, after killing a timed-out

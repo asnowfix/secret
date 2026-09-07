@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -37,6 +38,10 @@ func TestOSStatusMirrors(t *testing.T) {
 	}
 	if secItemNotFoundStatus != errSecItemNotFoundValue {
 		t.Errorf("secItemNotFoundStatus = %d, want errSecItemNotFound (%d)", secItemNotFoundStatus, errSecItemNotFoundValue)
+	}
+	if secInteractionNotAllowedStatus != errSecInteractionNotAllowed {
+		t.Errorf("secInteractionNotAllowedStatus = %d, want %s (%d)",
+			secInteractionNotAllowedStatus, errSecInteractionNotAllowedName, errSecInteractionNotAllowed)
 	}
 }
 
@@ -171,6 +176,12 @@ func TestQueriesRefuseKeychainUI(t *testing.T) {
 //
 // This reads back process state from the Security framework; it opens no
 // keychain and stores nothing.
+//
+// Deliberately not parallel and deliberately not restored: it leaves keychain
+// UI refused for every test that runs after it in this binary. That is the
+// state production runs in, and the state the other tests here want, so the
+// leak is harmless — but it is a leak, and a future test that needs the
+// dialog back will have to set it back itself.
 func TestRefuseKeychainUIDisablesLegacyKeychainUI(t *testing.T) {
 	refuseKeychainUI()
 	allowed, answered := keychainUIAllowed()
@@ -326,5 +337,159 @@ func TestPasswordsApp_RoundTrip_Live(t *testing.T) {
 	}
 	if !slices.Contains(services, service) {
 		t.Errorf("List() did not contain %q", service)
+	}
+}
+
+// TestClassifyPasswordsAppDelete is the regression guard for the defect this
+// PR's own UI refusal made reachable: sec_delete_item kept one shared
+// OSStatus that the internet-class delete overwrote unconditionally, so a
+// generic-class delete refused with errSecInteractionNotAllowed was reported
+// as the internet class's errSecItemNotFound — i.e. *ErrNotFound.
+//
+// That is not a cosmetic misclassification. cmd/gitcredential.go suppresses
+// *ErrNotFound from Delete entirely, so `git credential reject` returned
+// success having erased nothing, and git then retried forever against a
+// credential it believed it had removed. Same bug class as #30 and #36, on
+// the shipped macOS default backend.
+//
+// The first case below is the exact status pair that path produces.
+func TestClassifyPasswordsAppDelete(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name                  string
+		stGeneric, stInternet int32
+		wantNotFound          bool
+	}{
+		{
+			// The #44 shape: the ACL does not cover this binary, so the
+			// generic delete is refused rather than shown a dialog, and the
+			// internet delete matches no kSecAttrServer item.
+			name:      "generic refused, internet not found is not a definite absence",
+			stGeneric: errSecInteractionNotAllowed, stInternet: errSecItemNotFoundValue,
+			wantNotFound: false,
+		},
+		{
+			name:      "generic not found, internet refused is not a definite absence",
+			stGeneric: errSecItemNotFoundValue, stInternet: errSecInteractionNotAllowed,
+			wantNotFound: false,
+		},
+		{
+			name:      "both refused is not a definite absence",
+			stGeneric: errSecInteractionNotAllowed, stInternet: errSecInteractionNotAllowed,
+			wantNotFound: false,
+		},
+		{
+			name:      "both not found is a definite absence",
+			stGeneric: errSecItemNotFoundValue, stInternet: errSecItemNotFoundValue,
+			wantNotFound: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := classifyPasswordsAppDelete("github.com", tc.stGeneric, tc.stInternet)
+			var notFound *ErrNotFound
+			gotNotFound := errors.As(err, &notFound)
+			if gotNotFound != tc.wantNotFound {
+				t.Fatalf("classifyPasswordsAppDelete(%d, %d) = %v (%T); ErrNotFound=%v, want %v",
+					tc.stGeneric, tc.stInternet, err, err, gotNotFound, tc.wantNotFound)
+			}
+			if tc.wantNotFound {
+				return
+			}
+			var unavailable *ErrUnavailable
+			if !errors.As(err, &unavailable) {
+				t.Fatalf("classifyPasswordsAppDelete(%d, %d) = %v (%T), want *ErrUnavailable",
+					tc.stGeneric, tc.stInternet, err, err)
+			}
+		})
+	}
+}
+
+// TestPasswordsAppWriteAndListErrorsAreTyped pins the convention Keychain.Add
+// and Keychain.List already follow and this backend had drifted from: a
+// failure to write or to enumerate is *ErrUnavailable, never an untyped
+// error. Nothing branches on it today; the Keychain/PasswordsApp divergence
+// in #36 also had no consumer, right up until it cost a credential.
+//
+// Driving the real Add/List would need a keychain that fails on demand, which
+// there is no way to arrange here, so this checks the classification these
+// methods construct — the part that was wrong — via the same helpers they use.
+func TestPasswordsAppWriteAndListErrorsAreTyped(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"delete", classifyPasswordsAppDelete("svc", errSecInteractionNotAllowed, errSecInteractionNotAllowed)},
+		{"read", classifyPasswordsAppLookup("svc", errSecInteractionNotAllowed, errSecItemNotFoundValue)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var unavailable *ErrUnavailable
+			if !errors.As(tc.err, &unavailable) {
+				t.Errorf("%s error = %v (%T), want *ErrUnavailable", tc.name, tc.err, tc.err)
+			}
+		})
+	}
+}
+
+// TestInteractionRefusedNoteExplainsTheStatusThisPackageCreates checks that
+// the one failure this file deliberately manufactures carries a cause and a
+// remedy rather than a bare number.
+//
+// Refusing keychain UI converts "show an unlock dialog" into
+// errSecInteractionNotAllowed, so a user with a locked keychain who used to
+// answer a dialog and get their credential now gets an error instead. If that
+// error says only "Security error (generic query: -25308...)", the change has
+// removed their only route to understanding what happened — `secret` is the
+// shipped macOS default, and gitCredentialGet discards the error entirely, so
+// this string is the only place the cause can surface.
+func TestInteractionRefusedNoteExplainsTheStatusThisPackageCreates(t *testing.T) {
+	t.Parallel()
+
+	if note := interactionRefusedNote(errSecItemNotFoundValue, errSecSuccessValue); note != "" {
+		t.Errorf("interactionRefusedNote(not-found, success) = %q, want empty: "+
+			"asserting a cause for a status it does not describe is the mistake "+
+			"keychainUnavailableReason exists to record", note)
+	}
+
+	err := classifyPasswordsAppLookup("github.com", errSecInteractionNotAllowed, errSecInteractionNotAllowed)
+	msg := err.Error()
+	for _, want := range []string{"keychain dialog", "locked", "access control"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error for errSecInteractionNotAllowed = %q, want it to mention %q", msg, want)
+		}
+	}
+	if !strings.Contains(msg, strconv.Itoa(errSecInteractionNotAllowed)) {
+		t.Errorf("error for errSecInteractionNotAllowed = %q, want it to still carry the raw status %d",
+			msg, errSecInteractionNotAllowed)
+	}
+}
+
+// TestRefuseKeychainUINoteReportsALatchedFailure covers the sync.Once latch:
+// if SecKeychainSetUserInteractionAllowed fails, it is never retried for the
+// life of the process, and without this note a hang caused by the lever
+// having silently failed would look exactly like the residual risk this
+// design knowingly accepts (a wedged securityd).
+func TestRefuseKeychainUINoteReportsALatchedFailure(t *testing.T) {
+	// Not parallel: it swaps a package-level variable.
+	saved := refuseKeychainUIStatus
+	t.Cleanup(func() { refuseKeychainUIStatus = saved })
+
+	refuseKeychainUIStatus = secSuccessStatus
+	if note := refuseKeychainUINote(); note != "" {
+		t.Errorf("refuseKeychainUINote() = %q on success, want empty", note)
+	}
+
+	refuseKeychainUIStatus = errSecInteractionNotAllowed
+	note := refuseKeychainUINote()
+	if !strings.Contains(note, "SecKeychainSetUserInteractionAllowed") {
+		t.Errorf("refuseKeychainUINote() = %q, want it to name the lever that failed", note)
+	}
+	if !strings.Contains(note, strconv.Itoa(errSecInteractionNotAllowed)) {
+		t.Errorf("refuseKeychainUINote() = %q, want it to carry the status %d", note, errSecInteractionNotAllowed)
 	}
 }

@@ -6,9 +6,17 @@ import "time"
 // wait for any *machine* on the other end of an external call: the
 // /usr/bin/security subprocess on macOS, a Secret Service provider on the
 // D-Bus session bus on Linux, securityd behind the Security framework.
-// Every such bound in this package must be <= this value, and
-// TestExternalCallBoundsRespectCap (per platform) fails the build if one
-// is not.
+// Every such bound in this package must be <= this value, and the tests fail
+// the build if one is not: TestExternalCallTimeoutRespectsCap on every
+// platform, TestSecurityBoundsRespectCap on darwin,
+// TestDbusCallTimeoutRespectsCap on linux.
+//
+// The cap is per call, not per command. A single CLI invocation composes
+// several bounded calls — `secret password foo` on the Keychain backend runs
+// IsAvailable, then a generic find, then an internet find — so the worst case
+// a *user* can see is a multiple of this, not this. Bounding the command as a
+// whole would be a different (and larger) change; what the cap guarantees is
+// that no individual call can hang forever.
 //
 // It deliberately does not apply to a wait for a *person*. The distinction
 // is the thing being waited on, not the wall-clock length: a machine that

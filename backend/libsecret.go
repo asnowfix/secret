@@ -147,8 +147,13 @@ const promptWaitTimeout = 2 * time.Minute
 // dbus-run-session recipe in .github/workflows/ci.yml), so there is no
 // working response time on record to take 2x of. What the shared floor
 // gives it is compliance with maxExternalCallTimeout, which 10s was not.
-// If Linux measurements ever become available and argue for a tighter
-// per-site value, this is the constant to split out.
+// If Linux measurements ever become available and argue for a different
+// per-site value, this is the constant to split out — and the thing to
+// measure is *activation* latency, not round-trip latency. A warm provider
+// answers in microseconds; a cold one has to be D-Bus-activated first, which
+// is plausibly multi-second on a loaded desktop and is the only case where 5s
+// could be tight. CI's dbus-run-session recipe starts the daemon up front, so
+// it never exercises that path.
 const dbusCallTimeout = externalCallTimeout
 
 // callCtx returns a context bounded by dbusCallTimeout, for use with

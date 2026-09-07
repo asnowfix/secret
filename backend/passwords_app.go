@@ -38,8 +38,11 @@ package backend
 //      comes from. It is the only lever for that path.
 //
 // Both make the call return errSecInteractionNotAllowed (-25308) instead of
-// waiting. classifyPasswordsAppLookup and isRealFailure already route that to
-// *ErrUnavailable, so the caller gets an actionable error rather than a hang.
+// waiting, on every entry point: the read paths classify it through
+// classifyPasswordsAppLookup, Delete through classifyPasswordsAppDelete, and
+// Add and List construct *ErrUnavailable directly. So the caller gets a typed,
+// actionable error rather than a hang — and never *ErrNotFound, which would
+// turn "I could not tell" into "it is not there".
 //
 // Apple's suggested replacement for kSecUseAuthenticationUIFail is
 // kSecUseAuthenticationContext with LAContext.interactionNotAllowed, which
@@ -79,20 +82,18 @@ static OSStatus sec_user_interaction_allowed(int *allowed) {
 // of the seven call sites. That is not hypothetical tidiness: the defect this
 // function exists to fix was precisely that none of them set it.
 //
-// Every caller passes a literal n of 5 or fewer, so the NULL return for an
-// oversized n is unreachable today; it is there so that a future caller that
-// does exceed the buffer fails on a NULL dictionary rather than silently
-// smashing the stack.
-#define _NO_UI_DICT_MAX 8
+// It builds into a mutable dictionary rather than copying into a fixed-size
+// stack buffer: with no buffer there is no size to get wrong, no bounds
+// check to get wrong (a signed CFIndex makes "n too large" and "n negative"
+// two separate mistakes), and no failure return for the callers to check —
+// so no way for this to hand back a NULL that the nine CFRelease(q) sites
+// would turn into a crash.
 static CFDictionaryRef _no_ui_dict(const void **k, const void **v, CFIndex n) {
-	const void *ks[_NO_UI_DICT_MAX + 1];
-	const void *vs[_NO_UI_DICT_MAX + 1];
-	if (n > _NO_UI_DICT_MAX) return NULL;
-	for (CFIndex i = 0; i < n; i++) { ks[i] = k[i]; vs[i] = v[i]; }
-	ks[n] = kSecUseAuthenticationUI;
-	vs[n] = kSecUseAuthenticationUIFail;
-	return CFDictionaryCreate(NULL, ks, vs, n + 1,
+	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, n + 1,
 		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	for (CFIndex i = 0; i < n; i++) CFDictionarySetValue(d, k[i], v[i]);
+	CFDictionarySetValue(d, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
+	return d;
 }
 
 // sec_dict_refuses_ui reports whether a dictionary built by _no_ui_dict
@@ -103,7 +104,6 @@ static int sec_dict_refuses_ui(void) {
 	const void *k[] = {kSecClass};
 	const void *v[] = {kSecClassGenericPassword};
 	CFDictionaryRef q = _no_ui_dict(k, v, 1);
-	if (!q) return 0;
 	CFTypeRef ui = CFDictionaryGetValue(q, kSecUseAuthenticationUI);
 	int ok = (ui != NULL) && CFEqual(ui, kSecUseAuthenticationUIFail);
 	CFRelease(q);
@@ -313,29 +313,51 @@ static char* sec_copy_all_services(OSStatus *stGeneric, OSStatus *stInternet) {
 // sec_delete_item deletes an item by service name.
 // Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny ensures iCloud-synced items can be deleted too.
-static OSStatus sec_delete_item(const char *name) {
+//
+// The two deletes' OSStatus results are reported separately via stGeneric/
+// stInternet, for the same reason sec_copy_password and sec_copy_all_services
+// do it, and with more at stake. This function used to keep one shared status
+// that the internet-class delete overwrote unconditionally, so a generic-class
+// delete that failed for a real reason was reported as whatever the internet
+// query said — and the internet query, matching no kSecAttrServer item,
+// says errSecItemNotFound.
+//
+// That collapse became reachable the moment this file started refusing
+// keychain UI. An item whose ACL does not grant this binary (issue #44) used
+// to block the generic delete on an authorization dialog; it now returns
+// errSecInteractionNotAllowed immediately, which is precisely the status the
+// shared variable then threw away. The caller saw "nothing to delete", and
+// cmd/gitcredential.go suppresses *ErrNotFound from Delete entirely, so
+// `git credential reject` reported success having deleted nothing. That is
+// issue #36 / #30's bug class, on the shipped macOS default backend; commit
+// 1cd8575 fixed the identical collapse in Keychain.Delete and in this file's
+// read path, and this delete path was the one it missed.
+static void sec_delete_item(const char *name, OSStatus *stGeneric, OSStatus *stInternet) {
 	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
-	OSStatus st;
+	*stGeneric = errSecItemNotFound;
+	*stInternet = errSecItemNotFound;
 
 	{
 		const void *k[] = {kSecClass, kSecAttrService, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassGenericPassword, n, kSecAttrSynchronizableAny};
 		CFDictionaryRef q = _no_ui_dict(k, v, 3);
-		st = SecItemDelete(q);
+		*stGeneric = SecItemDelete(q);
 		CFRelease(q);
-		if (st == errSecSuccess) { CFRelease(n); return st; }
+		// A generic-class hit is the whole job: return without attempting
+		// the internet class, leaving stInternet at its "not attempted, and
+		// therefore not found" initial value.
+		if (*stGeneric == errSecSuccess) { CFRelease(n); return; }
 	}
 
 	{
 		const void *k[] = {kSecClass, kSecAttrServer, kSecAttrSynchronizable};
 		const void *v[] = {kSecClassInternetPassword, n, kSecAttrSynchronizableAny};
 		CFDictionaryRef q = _no_ui_dict(k, v, 3);
-		st = SecItemDelete(q);
+		*stInternet = SecItemDelete(q);
 		CFRelease(q);
 	}
 
 	CFRelease(n);
-	return st;
 }
 */
 import "C"
@@ -360,7 +382,16 @@ func NewPasswordsApp() *PasswordsApp { return &PasswordsApp{} }
 // SecKeychainSetUserInteractionAllowed(FALSE) that stops legacy-keychain
 // calls from putting up an unlock or ACL dialog (issue #37; see the C
 // preamble for why this and kSecUseAuthenticationUIFail are both needed).
-var refuseKeychainUIOnce sync.Once
+// refuseKeychainUIStatus records what that one attempt returned, because
+// sync.Once *latches*: if the lever fails, it is never retried for the life
+// of the process. Without recording it, a hang caused by the lever having
+// silently failed would be indistinguishable from the residual risk this
+// design does knowingly accept (a wedged securityd) — and the whole point of
+// the #37 fix is that a caller can tell what happened to it.
+var (
+	refuseKeychainUIOnce   sync.Once
+	refuseKeychainUIStatus int32
+)
 
 // refuseKeychainUI turns off keychain UI for this process. Every method that
 // reaches the Security framework calls it first, rather than doing it in
@@ -379,12 +410,31 @@ var refuseKeychainUIOnce sync.Once
 //   - It is never restored. There is no point in the CLI's life where it
 //     would want the dialog back; restoring it around each call would also
 //     race with any concurrent caller and reopen the hole for the duration.
-//   - Its failure is deliberately ignored. If the call fails, the worst case
-//     is exactly today's behaviour on the legacy path, and the
-//     kSecUseAuthenticationUIFail key still covers the Data Protection path;
-//     refusing to run at all would be a strictly worse trade.
+//   - Its failure does not stop the operation, but is not swallowed either.
+//     If the call fails, the worst case is exactly the pre-#37 behaviour on
+//     the legacy path and kSecUseAuthenticationUIFail still covers the Data
+//     Protection path, so refusing to run at all would be a strictly worse
+//     trade. It is recorded in refuseKeychainUIStatus and appended to
+//     whatever error the operation goes on to produce, so a lever that
+//     silently failed is visible in the diagnostic rather than only in the
+//     symptom.
 func refuseKeychainUI() {
-	refuseKeychainUIOnce.Do(func() { C.sec_refuse_user_interaction() })
+	refuseKeychainUIOnce.Do(func() {
+		refuseKeychainUIStatus = int32(C.sec_refuse_user_interaction())
+	})
+}
+
+// refuseKeychainUINote reports that the UI-refusal lever itself failed, for
+// appending to an error message. Empty in the normal case, which is every
+// case observed so far.
+func refuseKeychainUINote() string {
+	if refuseKeychainUIStatus == secSuccessStatus {
+		return ""
+	}
+	return fmt.Sprintf(
+		" (note: SecKeychainSetUserInteractionAllowed failed with Security error %d,"+
+			" so legacy-keychain calls in this process may still be waiting on a dialog)",
+		refuseKeychainUIStatus)
 }
 
 // keychainUIAllowed reports the process-global keychain-UI state that
@@ -429,20 +479,75 @@ func notFoundInBothQueries(stGeneric, stInternet int32) bool {
 	return stGeneric == secItemNotFoundStatus && stInternet == secItemNotFoundStatus
 }
 
-// classifyPasswordsAppLookup maps the pair of OSStatus values behind a NULL
-// sec_copy_password/sec_copy_username result onto the Backend error types
-// callers switch on, mirroring classifySecurityError (keychain.go),
-// classifyBusError (libsecret.go) and classifyCredError (wincred.go). It is
-// one function rather than a copy per accessor because divergence between two
-// copies of an error classification stays invisible until it costs a
-// credential.
-func classifyPasswordsAppLookup(service string, stGeneric, stInternet int32) error {
+// interactionRefusedNote explains errSecInteractionNotAllowed, and says what
+// to do about it, when it appears among statuses. Empty for every other
+// status.
+//
+// It gets a name and a remedy because this package is what produces it:
+// refuseKeychainUI and kSecUseAuthenticationUIFail deliberately convert every
+// keychain dialog into this status (#37), which makes it the expected failure
+// for the two cases a user is most likely to hit and least able to diagnose
+// from a bare number — a locked login keychain, and an item whose access
+// control does not cover this binary (#44). Before that change those cases
+// showed a dialog; a user who answered it got their credential, and one who
+// could not at least saw something. They now get an error, so the error has
+// to carry what the dialog would have.
+//
+// Cause first, remedy second, and the remedy phrased as a suggestion —
+// keychainUnavailableReason (keychain.go) records why: a message that asserts
+// one cause stays wrong for every other one. Every status other than
+// errSecInteractionNotAllowed keeps the bare numeric form for exactly that
+// reason.
+func interactionRefusedNote(statuses ...int32) string {
+	for _, st := range statuses {
+		if st == secInteractionNotAllowedStatus {
+			return " — macOS needed a keychain dialog to answer this and secret refuses" +
+				" them, so the item could not be reached; if your login keychain is locked," +
+				" unlocking it and retrying should fix this, and if it is already unlocked" +
+				" the item's access control most likely does not cover this binary"
+		}
+	}
+	return ""
+}
+
+// classifyPasswordsAppStatuses maps a pair of OSStatus values from the
+// generic- and internet-class calls onto the Backend error types callers
+// switch on, mirroring classifySecurityError (keychain.go), classifyBusError
+// (libsecret.go) and classifyCredError (wincred.go).
+//
+// Only a definitive miss in *both* classes may be *ErrNotFound. cmd/set.go
+// reads that as "safe to overwrite" and cmd/gitcredential.go suppresses it
+// from Delete entirely, so anything less certain has to be *ErrUnavailable:
+// "I could not tell" reported as "it is not there" is issue #30's bug class,
+// and #36's, and it is the one this project has spent four issues removing.
+//
+// op names the operation for the message ("read", "delete"), the way
+// classifySecurityError does in keychain.go.
+func classifyPasswordsAppStatuses(op, service string, stGeneric, stInternet int32) error {
 	if notFoundInBothQueries(stGeneric, stInternet) {
 		return &ErrNotFound{Service: service}
 	}
 	return &ErrUnavailable{Reason: fmt.Sprintf(
-		"could not read keychain item for %q: Security error (generic query: %d, internet query: %d)",
-		service, stGeneric, stInternet)}
+		"could not %s keychain item for %q: Security error (generic query: %d, internet query: %d)%s",
+		op, service, stGeneric, stInternet,
+		interactionRefusedNote(stGeneric, stInternet)+refuseKeychainUINote())}
+}
+
+// classifyPasswordsAppLookup classifies a NULL sec_copy_password /
+// sec_copy_username result. It is one function rather than a copy per
+// accessor because divergence between two copies of an error classification
+// stays invisible until it costs a credential.
+func classifyPasswordsAppLookup(service string, stGeneric, stInternet int32) error {
+	return classifyPasswordsAppStatuses("read", service, stGeneric, stInternet)
+}
+
+// classifyPasswordsAppDelete classifies a sec_delete_item result that did not
+// succeed in either class. It shares classifyPasswordsAppStatuses with the
+// read path deliberately: the delete path had its own, weaker rule — one
+// shared status, errSecItemNotFound wins — and that is what made a refused
+// authorization report as a successful no-op erase.
+func classifyPasswordsAppDelete(service string, stGeneric, stInternet int32) error {
+	return classifyPasswordsAppStatuses("delete", service, stGeneric, stInternet)
 }
 
 func (p *PasswordsApp) GetPassword(service string) (string, error) {
@@ -479,24 +584,32 @@ func (p *PasswordsApp) Add(service, account, password string) error {
 	defer C.free(unsafe.Pointer(svc))
 	defer C.free(unsafe.Pointer(acct))
 	defer C.free(unsafe.Pointer(pw))
+	// A write has no meaningful "not found" outcome, so every failure here is
+	// *ErrUnavailable — the same rule, and the same reason, as Keychain.Add.
 	if st := C.sec_add_generic_password(svc, acct, pw); st != C.errSecSuccess {
-		return fmt.Errorf("failed to add secret for '%s': Security error %d", service, st)
+		return &ErrUnavailable{Reason: fmt.Sprintf(
+			"failed to add secret for '%s': Security error %d%s",
+			service, int32(st), interactionRefusedNote(int32(st))+refuseKeychainUINote())}
 	}
 	return nil
 }
 
+// Delete removes the credential for service, trying the generic-password
+// class and then the internet-password class.
+//
+// Success in either class is a delete. Anything else is classified from
+// *both* statuses rather than from whichever one happened to be written
+// last: see sec_delete_item's comment for what collapsing them cost.
 func (p *PasswordsApp) Delete(service string) error {
 	refuseKeychainUI()
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
-	st := C.sec_delete_item(svc)
-	if st == C.errSecItemNotFound {
-		return &ErrNotFound{Service: service}
+	var stGeneric, stInternet C.OSStatus
+	C.sec_delete_item(svc, &stGeneric, &stInternet)
+	if int32(stGeneric) == secSuccessStatus || int32(stInternet) == secSuccessStatus {
+		return nil
 	}
-	if st != C.errSecSuccess {
-		return fmt.Errorf("failed to delete secret for '%s': Security error %d", service, st)
-	}
-	return nil
+	return classifyPasswordsAppDelete(service, int32(stGeneric), int32(stInternet))
 }
 
 func (p *PasswordsApp) Edit() error {
@@ -524,8 +637,15 @@ func (p *PasswordsApp) List() ([]string, error) {
 		}
 	}()
 
+	// *ErrUnavailable rather than an untyped error, matching Keychain.List:
+	// "I could not enumerate the store" is a backend-unavailable condition,
+	// and a caller that wants to tell it apart from an empty store needs a
+	// type to test, not a string.
 	if isRealFailure(int32(stGeneric)) || isRealFailure(int32(stInternet)) {
-		return nil, fmt.Errorf("failed to list secrets: Security error (generic query: %d, internet query: %d)", stGeneric, stInternet)
+		return nil, &ErrUnavailable{Reason: fmt.Sprintf(
+			"failed to list secrets: Security error (generic query: %d, internet query: %d)%s",
+			int32(stGeneric), int32(stInternet),
+			interactionRefusedNote(int32(stGeneric), int32(stInternet))+refuseKeychainUINote())}
 	}
 
 	if raw == nil {
@@ -539,9 +659,15 @@ func (p *PasswordsApp) List() ([]string, error) {
 // than referenced as C.OSStatus so isRealFailure and notFoundInBothQueries —
 // and the tests that drive them — don't need a cgo preamble; cgo is not
 // supported in _test.go files.
+//
+// secInteractionNotAllowedStatus is here for the same reason but a different
+// purpose: it is the status this file's UI refusal deliberately produces
+// (#37), so it is the one failure interactionRefusedNote can explain rather
+// than merely number.
 var (
-	secSuccessStatus      = int32(C.errSecSuccess)
-	secItemNotFoundStatus = int32(C.errSecItemNotFound)
+	secSuccessStatus               = int32(C.errSecSuccess)
+	secItemNotFoundStatus          = int32(C.errSecItemNotFound)
+	secInteractionNotAllowedStatus = int32(C.errSecInteractionNotAllowed)
 )
 
 // isRealFailure reports whether st represents an actual failure to query
