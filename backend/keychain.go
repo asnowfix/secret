@@ -31,7 +31,13 @@ const securityBinary = "/usr/bin/security"
 // os.DevNull (immediate EOF) rather than from the parent's terminal since
 // Go 1.0 — so the fix has to bound the call itself, not stdin. (What Go 1.20
 // added, and what runSecurity uses, is Cmd.Cancel/Cmd.WaitDelay.)
-const securityCommandTimeout = 10 * time.Second
+//
+// The value comes from externalCallTimeout (timeouts.go), which carries the
+// measurements it was derived from and the reasoning for the floor applied
+// to them. Note the effective worst case is this plus securityWaitDelay
+// below; both together must stay under maxExternalCallTimeout, which
+// TestExternalCallBoundsRespectCap asserts.
+const securityCommandTimeout = externalCallTimeout
 
 // securityWaitDelay is how long runSecurity waits, after killing a timed-out
 // security process, for its inherited stdout/stderr pipes to close before

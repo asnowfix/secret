@@ -931,3 +931,21 @@ func TestDedupSorted(t *testing.T) {
 		t.Fatal("expected nil for empty input")
 	}
 }
+
+// TestDbusCallTimeoutRespectsCap pins the D-Bus bound under the hard ceiling
+// from timeouts.go.
+//
+// promptWaitTimeout is deliberately not checked: it is the window a *human*
+// gets to answer a Secret Service unlock dialog, and the cap bounds waits on
+// machines. Asserting it here would encode the opposite rule.
+func TestDbusCallTimeoutRespectsCap(t *testing.T) {
+	t.Parallel()
+	if dbusCallTimeout > maxExternalCallTimeout {
+		t.Errorf("dbusCallTimeout = %s, exceeds maxExternalCallTimeout (%s)",
+			dbusCallTimeout, maxExternalCallTimeout)
+	}
+	if promptWaitTimeout <= dbusCallTimeout {
+		t.Errorf("promptWaitTimeout (%s) <= dbusCallTimeout (%s); the wait for a person must stay longer than the wait for the provider",
+			promptWaitTimeout, dbusCallTimeout)
+	}
+}
