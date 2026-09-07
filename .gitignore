@@ -32,6 +32,7 @@ resource_windows.syso
 
 # env file
 .env
+.envrc
 
 # Editor/IDE
 # .idea/
