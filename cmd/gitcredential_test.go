@@ -352,6 +352,12 @@ func TestRunGitCredentialHelper_Erase(t *testing.T) {
 		if !strings.Contains(stderr.String(), "refusing to erase") {
 			t.Fatalf("got stderr %q, want it to say why the erase was refused", stderr.String())
 		}
+		// The remedy is load-bearing, not decoration: refusing leaves git
+		// retrying against a credential it knows is bad, and this line is
+		// the only thing telling the user how to get out of that.
+		if !strings.Contains(stderr.String(), "secret delete github.com") {
+			t.Fatalf("got stderr %q, want it to name the manual remedy for the service it refused", stderr.String())
+		}
 		if strings.Contains(stderr.String(), "alice-token") {
 			t.Fatalf("password leaked onto stderr: %q", stderr.String())
 		}

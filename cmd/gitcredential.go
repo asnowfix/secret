@@ -289,7 +289,19 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 			// documented on gitCredentialGet. git ignores an erase's output
 			// (gitcredentials(7)), so this is for a human wondering why the
 			// credential is still there.
-			fmt.Fprintf(stderr, "git-credential-secret: could not determine which username is stored for '%s', refusing to erase a credential that may not be the one git asked about: %v\n", service, indeterminate)
+			//
+			// Cause first, remedy second, following
+			// keychainUnavailableReason (backend/keychain.go). The remedy is
+			// not decoration here: refusing leaves git retrying against a
+			// credential it knows is bad, and this line is the only thing
+			// that tells the user how to break out of that. It has to stand
+			// on its own, too — a helper's stderr reaches a human at a
+			// terminal, but GUI clients (VS Code, Sourcetree, GitKraken)
+			// discard it, so anyone who does see it may be seeing it out of
+			// context, and some refusals (an item whose account attribute
+			// cannot be parsed at all) repeat forever rather than clearing
+			// on the next attempt.
+			fmt.Fprintf(stderr, "git-credential-secret: could not determine which username is stored for '%s', refusing to erase a credential that may not be the one git asked about: %v — retry once the store is readable, or remove it by hand with `secret delete %s`\n", service, indeterminate, service)
 			return
 		}
 		if !proceed {
@@ -312,29 +324,60 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 // It is the erase-side counterpart of classifySetTarget (cmd/set.go) and
 // exists for the same reason: a failed read is not an answer. GetUsername
 // can fail on any backend for reasons that say nothing about who is stored
-// — a keychain re-locked between this helper's IsAvailable check and this
-// call, a stale D-Bus session, a transport fault, a timeout — while Delete
-// still succeeds afterwards. Letting the delete run in that case means an
-// erase naming bob destroys alice's credential, so only a definitive answer
+// — a locked keychain, a stale D-Bus session, a transport fault, a timeout,
+// an item whose account attribute cannot be parsed — while Delete still
+// succeeds afterwards. Letting the delete run in that case means an erase
+// naming bob destroys alice's credential, so only a definitive answer
 // authorises it:
 //
 //   - read succeeded: proceed only on an exact match, as before.
-//   - *backend.ErrNotFound: definitive, and there is nothing to lose.
-//     The delete is still allowed, so an erase behaves the same as the
-//     no-username case on a backend whose GetUsername and Delete disagree
-//     about what is stored; if the credential really is absent, Delete's
-//     own ErrNotFound is swallowed as the normal outcome it is.
+//   - *backend.ErrNotFound: proceed. Not because the delete achieves
+//     anything — every backend's read covers at least what its Delete
+//     covers (on macOS GetUsername looks at generic then internet items,
+//     where Delete reaches the internet class only after a definitive
+//     generic miss; on Linux both hinge on the same searchItems result), so
+//     where the two agree this branch is a no-op. It proceeds because
+//     *ErrNotFound is each backend's contract for "definitively absent"
+//     (backend/backend.go), and a definitive answer is precisely what this
+//     function asks for; Delete's own ErrNotFound is then swallowed as the
+//     normal outcome it is. One backend currently breaks that contract:
+//     see #48, where wincred returns *ErrNotFound after CredReadW
+//     succeeded but UserName was NULL, i.e. for a credential that does
+//     exist. That is a violation of the contract rather than a flaw in
+//     relying on it, predates this function (the previous guard fell
+//     through to Delete identically), and is fixed there rather than
+//     worked around here.
 //   - anything else: indeterminate, handed back for the caller to refuse
 //     on rather than guessed at.
 //
+// runGitCredentialHelper's IsAvailable check is no protection against any
+// of this: on the two backends most users are on it never touches the store
+// at all — CredentialManager, the only Windows backend, merely loads
+// advapi32, and PasswordsApp, the default on macOS 15+, merely stats the
+// app bundle — so a later indeterminate read does not mean the store became
+// unreadable mid-run. It may never have been established as readable.
+//
 // Refusing has a cost of its own — git cannot clear a credential it knows
-// is bad, so it may keep retrying against the stale one — but that is
-// transient, visible on stderr and user-recoverable (retry once the store
-// is readable, or `secret delete <service>` by hand), whereas erasing
-// another user's credential is silent and irreversible. The trade is only
-// ever made when git supplied a username to narrow by; an erase that names
-// no username is asking for whatever is stored under that service and is
-// unaffected by this.
+// is bad, so it may keep retrying against the stale one — but it is
+// recoverable by hand (retry once the store is readable, or `secret delete
+// <service>`), whereas erasing another user's credential is silent and
+// irreversible. Not every refusal clears on retry: an item whose account
+// attribute cannot be parsed refuses every time, which is why the caller's
+// message carries the remedy and not only the cause.
+//
+// Nor is this the corner case it may look like: git's credential_reject()
+// sends every attribute it holds, username included, so after a fill this
+// helper served the guarded path is the ordinary reject path rather than
+// an unusual one. An erase naming no username — asking for whatever is
+// stored under that service, with no username to be wrong about — is the
+// exception, and is unaffected.
+//
+// What this bounds, and what it does not: it stops an unverified username
+// authorising a delete. It does not make a verified one safe on its own.
+// Per #49, Delete removes every item matching the service while the read
+// picks one, so where two credentials share a service an erase matching
+// bob can still take alice's with it — the guard passes and the harm
+// happens anyway.
 func classifyEraseTarget(want, current string, err error) (proceed bool, indeterminate error) {
 	if err == nil {
 		return current == want, nil
