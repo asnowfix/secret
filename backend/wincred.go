@@ -80,10 +80,42 @@ func (c *CredentialManager) GetUsername(service string) (string, error) {
 		return "", err
 	}
 	defer procCredFree.Call(uintptr(unsafe.Pointer(cred)))
+	return usernameFromCred(cred), nil
+}
+
+// usernameFromCred extracts the username from a credential CredReadW has
+// already returned successfully. It never manufactures *ErrNotFound: by the
+// time it runs, the credential is known to exist, so there is nothing left
+// to be "not found".
+//
+// A NULL UserName means this particular credential carries no username —
+// CREDENTIALW.UserName is legitimately NULL-able for CRED_TYPE_GENERIC — not
+// that nothing was found, so it maps to "", not an error. Returning
+// *ErrNotFound here (as this used to do) would tell both of GetUsername's
+// callers, wrongly, "there is nothing here": classifySetTarget (cmd/set.go)
+// would read it as "safe to create new" and skip the overwrite
+// confirmation, and classifyEraseTarget (cmd/gitcredential.go) would read
+// it as "definitively absent" and let an erase for any username proceed to
+// Delete, destroying a credential never shown to belong to the requesting
+// user (#48, the success-path sibling of #32).
+//
+// "" routes correctly at both instead: classifySetTarget treats a nil
+// GetUsername error as "exists" and still prompts before overwriting, and
+// classifyEraseTarget compares the stored username ("") against the
+// requested one and only proceeds on an exact match — it never asks
+// GetUsername anything when the request carries no username
+// (gitCredentialErase guards that), so this can never be misread as "erase
+// authorised for the empty username".
+//
+// Caveat: "CredReadW succeeds while UserName is NULL" is inferred from
+// CREDENTIALW's documented field semantics, not observed live against a
+// real Credential Manager — keep that uncertainty in mind if this is ever
+// revisited.
+func usernameFromCred(cred *nativeCredential) string {
 	if cred.UserName == nil {
-		return "", &ErrNotFound{Service: service}
+		return ""
 	}
-	return windows.UTF16PtrToString(cred.UserName), nil
+	return windows.UTF16PtrToString(cred.UserName)
 }
 
 func (c *CredentialManager) GetPassword(service string) (string, error) {

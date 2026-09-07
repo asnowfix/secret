@@ -393,6 +393,27 @@ func TestRunGitCredentialHelper_Erase(t *testing.T) {
 			t.Fatalf("got stderr %q, want empty: a not-found read is a normal outcome", stderr.String())
 		}
 	})
+
+	// #48: a credential that exists but carries no username (wincred's
+	// CredReadW succeeding with a NULL UserName) must read as "username is
+	// the empty string, read succeeded", never as *ErrNotFound. Modeled here
+	// with the fake backend's GetUsername returning ("", nil) — exactly what
+	// backend.CredentialManager.GetUsername now returns for that case — to
+	// prove an erase naming a real username still leaves such a credential
+	// alone rather than treating the NULL username as "nothing stored, safe
+	// to delete".
+	t.Run("credential with no stored username (NULL UserName, #48) is left alone on a named erase", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"", "no-username-token"}
+		var stdout, stderr bytes.Buffer
+		runGitCredentialHelper(b, "erase", strings.NewReader("protocol=https\nhost=github.com\nusername=bob\n\n"), &stdout, &stderr)
+		if _, ok := b.creds["github.com"]; !ok {
+			t.Fatal("credential with no stored username was erased for a request naming a different username")
+		}
+		if len(b.deleteCalls) != 0 {
+			t.Fatalf("Delete was called for a username that does not match the (empty) stored one: %v", b.deleteCalls)
+		}
+	})
 }
 
 func TestClassifyEraseTarget(t *testing.T) {
@@ -405,6 +426,11 @@ func TestClassifyEraseTarget(t *testing.T) {
 	}{
 		{name: "read succeeded, username matches", want: "bob", current: "bob", proceed: true},
 		{name: "read succeeded, username differs", want: "bob", current: "alice"},
+		// #48: a read that succeeds with an empty stored username (wincred's
+		// NULL UserName case) must be treated like any other mismatch, not
+		// like ErrNotFound — err is nil here, so this exercises the
+		// "read succeeded" branch, not the ErrNotFound branch below.
+		{name: "read succeeded, no username stored (NULL UserName, #48)", want: "bob", current: ""},
 		{name: "definitively nothing stored", want: "bob", err: &backend.ErrNotFound{Service: "github.com"}, proceed: true},
 		{name: "backend unavailable", want: "bob", err: &backend.ErrUnavailable{Reason: "keychain locked"}, wantIndeterminate: true},
 		{name: "wrapped unavailable", want: "bob", err: fmt.Errorf("reading username: %w", &backend.ErrUnavailable{Reason: "keychain locked"}), wantIndeterminate: true},
