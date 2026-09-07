@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -16,6 +17,13 @@ type fakeGitCredentialBackend struct {
 	available error
 	creds     map[string][2]string // service -> [account, password]
 
+	// usernameErr, when set, is what GetUsername returns instead of
+	// consulting creds — the way a real backend fails a read for a reason
+	// that says nothing about what is stored (re-locked keychain, D-Bus
+	// fault, timeout). Deliberately independent of creds so a test can have
+	// the read fail while the credential is still very much there.
+	usernameErr error
+
 	addCalls    []string
 	deleteCalls []string
 }
@@ -27,6 +35,9 @@ func newFakeGitCredentialBackend() *fakeGitCredentialBackend {
 func (f *fakeGitCredentialBackend) IsAvailable() error { return f.available }
 
 func (f *fakeGitCredentialBackend) GetUsername(service string) (string, error) {
+	if f.usernameErr != nil {
+		return "", f.usernameErr
+	}
 	c, ok := f.creds[service]
 	if !ok {
 		return "", &backend.ErrNotFound{Service: service}
@@ -319,6 +330,101 @@ func TestRunGitCredentialHelper_Erase(t *testing.T) {
 			t.Fatal("credential for a different username was erased")
 		}
 	})
+
+	// The regression this file exists to prevent (#42): an erase naming bob
+	// must not destroy alice's credential just because the stored username
+	// could not be read. Delete must not even be attempted.
+	t.Run("indeterminate username read refuses the erase", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"alice", "alice-token"}
+		b.usernameErr = &backend.ErrUnavailable{Reason: "keychain locked"}
+		var stdout, stderr bytes.Buffer
+		code := runGitCredentialHelper(b, "erase", strings.NewReader("protocol=https\nhost=github.com\nusername=bob\n\n"), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("got exit code %d, want 0", code)
+		}
+		if got, ok := b.creds["github.com"]; !ok || got[0] != "alice" {
+			t.Fatalf("erasing bob destroyed alice's credential on an indeterminate read: got %+v (present: %t)", got, ok)
+		}
+		if len(b.deleteCalls) != 0 {
+			t.Fatalf("Delete was called on an indeterminate username read: %v", b.deleteCalls)
+		}
+		if !strings.Contains(stderr.String(), "refusing to erase") {
+			t.Fatalf("got stderr %q, want it to say why the erase was refused", stderr.String())
+		}
+		// The remedy is load-bearing, not decoration: refusing leaves git
+		// retrying against a credential it knows is bad, and this line is
+		// the only thing telling the user how to get out of that.
+		if !strings.Contains(stderr.String(), "secret delete github.com") {
+			t.Fatalf("got stderr %q, want it to name the manual remedy for the service it refused", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "alice-token") {
+			t.Fatalf("password leaked onto stderr: %q", stderr.String())
+		}
+	})
+
+	// The refusal is scoped to requests that named a username: with none,
+	// git is asking for whatever is stored under the service, so there is no
+	// username to be wrong about and a failed read changes nothing.
+	t.Run("indeterminate username read still erases when no username was supplied", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"alice", "alice-token"}
+		b.usernameErr = &backend.ErrUnavailable{Reason: "keychain locked"}
+		var stdout, stderr bytes.Buffer
+		runGitCredentialHelper(b, "erase", strings.NewReader("protocol=https\nhost=github.com\n\n"), &stdout, &stderr)
+		if _, ok := b.creds["github.com"]; ok {
+			t.Fatal("credential was not erased: a read failure must not gate an erase that named no username")
+		}
+	})
+
+	// A definitive "nothing stored" is an answer, not a failure: the erase
+	// proceeds, so a backend whose GetUsername and Delete disagree about
+	// what is stored still gets its credential cleared.
+	t.Run("not-found username read still erases", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"bob", "s3cr3t"}
+		b.usernameErr = &backend.ErrNotFound{Service: "github.com"}
+		var stdout, stderr bytes.Buffer
+		runGitCredentialHelper(b, "erase", strings.NewReader("protocol=https\nhost=github.com\nusername=bob\n\n"), &stdout, &stderr)
+		if _, ok := b.creds["github.com"]; ok {
+			t.Fatal("credential was not erased after a definitive not-found username read")
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("got stderr %q, want empty: a not-found read is a normal outcome", stderr.String())
+		}
+	})
+}
+
+func TestClassifyEraseTarget(t *testing.T) {
+	tests := []struct {
+		name              string
+		want, current     string
+		err               error
+		proceed           bool
+		wantIndeterminate bool
+	}{
+		{name: "read succeeded, username matches", want: "bob", current: "bob", proceed: true},
+		{name: "read succeeded, username differs", want: "bob", current: "alice"},
+		{name: "definitively nothing stored", want: "bob", err: &backend.ErrNotFound{Service: "github.com"}, proceed: true},
+		{name: "backend unavailable", want: "bob", err: &backend.ErrUnavailable{Reason: "keychain locked"}, wantIndeterminate: true},
+		{name: "wrapped unavailable", want: "bob", err: fmt.Errorf("reading username: %w", &backend.ErrUnavailable{Reason: "keychain locked"}), wantIndeterminate: true},
+		{name: "opaque failure", want: "bob", err: errors.New("timed out talking to the secret store"), wantIndeterminate: true},
+		{name: "wrapped not-found is still definitive", want: "bob", err: fmt.Errorf("reading username: %w", &backend.ErrNotFound{Service: "github.com"}), proceed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proceed, indeterminate := classifyEraseTarget(tt.want, tt.current, tt.err)
+			if proceed != tt.proceed {
+				t.Errorf("got proceed %t, want %t", proceed, tt.proceed)
+			}
+			if (indeterminate != nil) != tt.wantIndeterminate {
+				t.Errorf("got indeterminate %v, want indeterminate: %t", indeterminate, tt.wantIndeterminate)
+			}
+			if indeterminate != nil && proceed {
+				t.Error("an indeterminate read must never authorise the delete")
+			}
+		})
+	}
 }
 
 func TestRunGitCredentialHelper_UnknownOperation(t *testing.T) {
