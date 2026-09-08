@@ -112,3 +112,32 @@ func TestClassifyCredError_OpInMessage(t *testing.T) {
 		t.Errorf("ErrUnavailable.Reason = %q, want it to mention op %q", unavailable.Reason, "delete")
 	}
 }
+
+// TestUsernameFromCred_NullUserName guards #48: CredReadW succeeding with a
+// NULL UserName means the credential exists but carries no username, not
+// that nothing was found. usernameFromCred (and therefore GetUsername) must
+// report "" here, never *ErrNotFound — see the doc comment on
+// usernameFromCred for why either call site misreading this as "absent"
+// is data-loss shaped (skipped overwrite confirmation in cmd/set.go, an
+// unauthorised delete in cmd/gitcredential.go).
+//
+// The "CredReadW succeeds while UserName is NULL" sequence itself is
+// inferred from CREDENTIALW's field semantics, not observed against a real
+// Credential Manager; this test only pins down what this codebase does once
+// that sequence occurs, not that it does occur.
+func TestUsernameFromCred_NullUserName(t *testing.T) {
+	got := usernameFromCred(&nativeCredential{UserName: nil})
+	if got != "" {
+		t.Fatalf("usernameFromCred(NULL UserName) = %q, want \"\"", got)
+	}
+}
+
+// TestUsernameFromCred_SetUserName guards the ordinary path alongside the
+// NULL case above, so a future change to usernameFromCred can't fix one at
+// the expense of the other.
+func TestUsernameFromCred_SetUserName(t *testing.T) {
+	got := usernameFromCred(&nativeCredential{UserName: mustUTF16Ptr(t, "bob")})
+	if got != "bob" {
+		t.Fatalf("usernameFromCred(UserName: %q) = %q, want %q", "bob", got, "bob")
+	}
+}
