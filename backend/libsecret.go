@@ -35,7 +35,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -455,12 +454,15 @@ func (s *SecretService) List() ([]string, error) {
 				// not be disclosed via List any more than via GetPassword.
 				continue
 			}
-			if svc := attrs[attrService]; svc != "" {
-				names = append(names, svc)
-			}
+			names = append(names, attrs[attrService])
 		}
 	}
-	return dedupSorted(names), nil
+	// DedupeSortServices (backend/backend.go) also drops empty entries, so a
+	// Secret Service provider that hands back an item with no "service"
+	// attribute at all (attrs[attrService] == "") is silently excluded here
+	// exactly as it is on every other backend, rather than surfacing as a
+	// blank line in `secret list`.
+	return DedupeSortServices(names), nil
 }
 
 // Edit has no sensible equivalent on Linux: there is no single native
@@ -655,27 +657,6 @@ func classifyBusError(err error) error {
 		return &ErrUnavailable{Reason: fmt.Sprintf("Secret Service D-Bus call failed: %s: %v", derr.Name, derr.Body)}
 	}
 	return &ErrUnavailable{Reason: err.Error()}
-}
-
-// dedupSorted returns a sorted copy of names with exact, case-sensitive
-// duplicates removed.
-//
-// TODO(#24): replace with the shared dedup+sort helper being added to
-// backend/backend.go by PR #24 (list-secrets-command) once this branch
-// rebases onto it, so all backends share one implementation.
-func dedupSorted(names []string) []string {
-	if len(names) == 0 {
-		return nil
-	}
-	sorted := append([]string(nil), names...)
-	sort.Strings(sorted)
-	out := make([]string, 0, len(sorted))
-	for i, n := range sorted {
-		if i == 0 || n != sorted[i-1] {
-			out = append(out, n)
-		}
-	}
-	return out
 }
 
 // runPromptOnConn drives a Secret Service Prompt object to completion:

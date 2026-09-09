@@ -727,7 +727,8 @@ func TestSecretService_List(t *testing.T) {
 			// Duplicate service name ("alpha") in a different collection, with
 			// no xdg:schema at all — a legacy item this backend itself wrote
 			// before the fix, still recognized as "own" by isOwnItem, so this
-			// exercises dedupSorted collapsing it with /item/2's "alpha".
+			// exercises DedupeSortServices collapsing it with /item/2's
+			// "alpha".
 			return dbus.MakeVariant(map[string]string{attrService: "alpha"}), nil
 		},
 	})
@@ -761,6 +762,82 @@ func TestSecretService_List(t *testing.T) {
 		if n == "gamma" {
 			t.Fatalf("expected the foreign-schema item's service (gamma) to be excluded, got %v", got)
 		}
+	}
+}
+
+// TestSecretService_List_EmptyServiceAttributeIsDropped discriminates the
+// first behavioural difference between the old private dedupSorted and the
+// shared DedupeSortServices helper (see backend/backend.go and issue #54): an
+// item with no "service" attribute at all must not surface as a blank entry
+// in `secret list`. This pins that Linux's List() drops it exactly as every
+// other backend does, so the two implementations cannot silently diverge on
+// this again.
+func TestSecretService_List_EmptyServiceAttributeIsDropped(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{"/collection/login"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/collection/login",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{"/item/1", "/item/2"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/1",
+		prop: func(string) (dbus.Variant, error) {
+			// No "service" attribute at all — attrs[attrService] reads back
+			// as "".
+			return dbus.MakeVariant(map[string]string{attrUsername: "a"}), nil
+		},
+	})
+	bus.register(&fakeObject{
+		path: "/item/2",
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant(map[string]string{attrService: "alpha"}), nil
+		},
+	})
+
+	s := newTestService(bus)
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"alpha"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("got %v, want %v (empty-service item should have been dropped)", got, want)
+	}
+}
+
+// TestSecretService_List_NoItemsReturnsNonNilEmptySlice discriminates the
+// second behavioural difference named in issue #54: the old private
+// dedupSorted returned a bare nil for empty input, while the shared
+// DedupeSortServices helper always allocates and returns a non-nil,
+// zero-length slice. This adopts the shared helper's contract on Linux too,
+// for consistency with the other backends, and pins it so it cannot silently
+// regress.
+func TestSecretService_List_NoItemsReturnsNonNilEmptySlice(t *testing.T) {
+	bus := newFakeBus(t)
+	bus.register(&fakeObject{
+		path: secretsPath,
+		prop: func(string) (dbus.Variant, error) {
+			return dbus.MakeVariant([]dbus.ObjectPath{}), nil
+		},
+	})
+
+	s := newTestService(bus)
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected a non-nil, zero-length slice for no items, got nil")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no results, got %v", got)
 	}
 }
 
@@ -913,22 +990,6 @@ func TestPickItem(t *testing.T) {
 	item, ok := pickItem([]dbus.ObjectPath{"/a", "/b"})
 	if !ok || item != "/a" {
 		t.Fatalf("got (%v, %v), want (/a, true)", item, ok)
-	}
-}
-
-func TestDedupSorted(t *testing.T) {
-	got := dedupSorted([]string{"b", "a", "b", "a", "c"})
-	want := []string{"a", "b", "c"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
-		}
-	}
-	if dedupSorted(nil) != nil {
-		t.Fatal("expected nil for empty input")
 	}
 }
 
