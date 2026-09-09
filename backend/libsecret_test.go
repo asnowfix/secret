@@ -765,13 +765,18 @@ func TestSecretService_List(t *testing.T) {
 	}
 }
 
-// TestSecretService_List_EmptyServiceAttributeIsDropped discriminates the
-// first behavioural difference between the old private dedupSorted and the
-// shared DedupeSortServices helper (see backend/backend.go and issue #54): an
-// item with no "service" attribute at all must not surface as a blank entry
-// in `secret list`. This pins that Linux's List() drops it exactly as every
-// other backend does, so the two implementations cannot silently diverge on
-// this again.
+// TestSecretService_List_EmptyServiceAttributeIsDropped pins that an item
+// with no "service" attribute at all (attrs[attrService] == "") does not
+// surface as a blank entry in `secret list`. This is a forward-looking
+// guard, not a before/after discriminator: the old code already dropped such
+// an item via an inline `if svc != ""` guard in List() before it ever built
+// the slice passed to the old private dedupSorted, so this test would pass
+// identically against the pre-#54 code too. What changed is *where* the
+// empty-dropping responsibility lives — it moved from that inline guard into
+// the shared DedupeSortServices helper (see backend/backend.go) — and this
+// test is what would catch a future regression in that helper's
+// empty-dropping, or any change that lets an empty service name through
+// List() again.
 func TestSecretService_List_EmptyServiceAttributeIsDropped(t *testing.T) {
 	bus := newFakeBus(t)
 	bus.register(&fakeObject{
@@ -812,13 +817,16 @@ func TestSecretService_List_EmptyServiceAttributeIsDropped(t *testing.T) {
 	}
 }
 
-// TestSecretService_List_NoItemsReturnsNonNilEmptySlice discriminates the
-// second behavioural difference named in issue #54: the old private
-// dedupSorted returned a bare nil for empty input, while the shared
-// DedupeSortServices helper always allocates and returns a non-nil,
-// zero-length slice. This adopts the shared helper's contract on Linux too,
-// for consistency with the other backends, and pins it so it cannot silently
-// regress.
+// TestSecretService_List_NoItemsReturnsNonNilEmptySlice does genuinely
+// discriminate old from new (unlike
+// TestSecretService_List_EmptyServiceAttributeIsDropped above): with no
+// collections at all, the old List() left `names` as its zero value (a nil
+// []string) and passed that straight into the old private dedupSorted,
+// which returned nil for empty input — so the old code returned nil here.
+// The shared DedupeSortServices helper always allocates via
+// make([]string, 0, len(names)), so it returns a non-nil, zero-length slice
+// instead. This adopts that contract on Linux too, for consistency with the
+// other backends, and pins it so it cannot silently regress.
 func TestSecretService_List_NoItemsReturnsNonNilEmptySlice(t *testing.T) {
 	bus := newFakeBus(t)
 	bus.register(&fakeObject{
