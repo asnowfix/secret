@@ -378,13 +378,23 @@ var securityPasswordLine = regexp.MustCompile(`(?m)^password: .*$`)
 // to the user and is the only handle on an unmodelled failure.
 //
 // The child is bounded via exec.CommandContext rather than a bare
-// exec.Command: on timeout the context's default Cancel kills the child, and
-// WaitDelay then bounds how long Wait will keep waiting on the stdout/stderr
-// pipes afterwards. Without WaitDelay the kill is not a hard bound, because
-// Stdout/Stderr are buffers rather than *os.File and Wait blocks until the
-// pipes reach EOF — which a grandchild holding them open would prevent.
-// cmd.Stdin is left nil, i.e. /dev/null, so the child can never block reading
-// from an inherited terminal either.
+// exec.Command, and WaitDelay bounds how long Wait will keep waiting on the
+// stdout/stderr pipes once the child is gone. Without WaitDelay that wait is
+// not a hard bound, because Stdout/Stderr are buffers rather than *os.File
+// and Wait blocks until the pipes reach EOF — which a grandchild that
+// inherited them and outlived the direct child would prevent even after the
+// direct child itself has exited or been killed.
+//
+// What is and is not reproduced: on Go 1.26.4/darwin, killing a direct child
+// that has no such grandchild — i.e. context cancellation alone, against a
+// process with nothing else holding its pipes open — did not exhibit an
+// unbounded wait either way; ctx's deadline made Run return on time with
+// WaitDelay unset just as it did with it set. The unbounded wait is real and
+// reproducible, but only via the grandchild-holding-the-pipe shape (see
+// TestRunSecurity_WaitDelayBoundsGrandchildHoldingPipe), not via context
+// cancellation of a childless direct child. cmd.Stdin is left nil, i.e.
+// /dev/null, so the child can never block reading from an inherited terminal
+// either.
 func (k *Keychain) runSecurity(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
 	defer cancel()

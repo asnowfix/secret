@@ -4,6 +4,7 @@ package backend
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,6 +108,31 @@ func TestHexDecode_OddLength(t *testing.T) {
 	t.Parallel()
 	if _, err := hexDecode("616"); err == nil {
 		t.Fatal("hexDecode(\"616\") = nil error, want a failure for an odd-length input")
+	}
+}
+
+// TestExitCodeConstants pins secItemNotFoundExitCode and securityLockedExitCode
+// against literals independent of the constants themselves (issue #45, item
+// 3). Every other test in this file scripts the stand-in *from* these
+// constants, so a change to either declaration is otherwise invisible to the
+// always-on suite: the mechanism stays pinned, but the value can drift
+// unnoticed. This mirrors the discipline TestOSStatusMirrors already applies
+// to its own mirrors in passwords_app_test.go.
+//
+// Both values are measured against the real /usr/bin/security, most recently
+// against an isolated scratch keychain on 2026-09-06 (see issue #45):
+// locked+absent exits 44 regardless of flag, locked+present exits 152 for a
+// data read (-w or -g). A flag-less read touches only unencrypted attributes
+// and exits 0 even locked, so that measurement is not evidence either way —
+// findPassword always passes -w or -g (see runSecurity's callers), so the
+// production path only ever sees the 44/152 split this test pins.
+func TestExitCodeConstants(t *testing.T) {
+	t.Parallel()
+	if secItemNotFoundExitCode != 44 {
+		t.Errorf("secItemNotFoundExitCode = %d, want 44 (measured against /usr/bin/security)", secItemNotFoundExitCode)
+	}
+	if securityLockedExitCode != 152 {
+		t.Errorf("securityLockedExitCode = %d, want 152 (measured against /usr/bin/security)", securityLockedExitCode)
 	}
 }
 
@@ -297,6 +323,48 @@ func newHangingKeychain(t *testing.T) *Keychain {
 	}
 }
 
+// grandchildHangSeconds is how long the grandchild left behind by
+// newGrandchildHangingKeychain's stand-in sleeps for. It only needs to
+// outlast securityWaitDelay by a comfortable margin — long enough that a
+// missing WaitDelay guard reliably blocks past the assertion's limit, short
+// enough that a mutated run does not sit around for real
+// newHangingKeychain-style minutes.
+const grandchildHangSeconds = 20
+
+// newGrandchildHangingKeychain returns a *Keychain whose security CLI
+// backgrounds a sleep that inherits its stdout/stderr pipes and then exits
+// itself almost immediately.
+//
+// This is deliberately not newHangingKeychain's shape. newHangingKeychain's
+// script is `#!/bin/sh\nexec sleep 300`: exec replaces the shell with sleep,
+// so sleep *is* the direct child, and killing it directly closes the pipes —
+// the scenario securityWaitDelay exists for never arises. Here the direct
+// child (the shell) exits on its own, quickly and successfully, while the
+// backgrounded sleep it leaves behind keeps holding the write end of the
+// inherited stdout/stderr pipes open. cmd.Wait has nothing to kill — the
+// process it is waiting on already exited — but it still cannot return until
+// those pipes reach EOF, which does not happen until the grandchild does.
+// That is exactly the case securityWaitDelay bounds, and it is independent of
+// context cancellation: nothing here ever hits k.timeout's deadline.
+func newGrandchildHangingKeychain(t *testing.T) *Keychain {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "security")
+	script := fmt.Sprintf("#!/bin/sh\nsleep %d &\nexit 0\n", grandchildHangSeconds)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return &Keychain{
+		keychainPath: filepath.Join(dir, "irrelevant.keychain-db"),
+		security:     binary,
+		// Generous and, unlike hangTimeout, irrelevant to what this stand-in
+		// tests: the direct child exits well within it, so the context
+		// deadline never fires. What is asserted below is bounded by
+		// securityWaitDelay alone.
+		timeout: standInTimeout,
+	}
+}
+
 // newMissingBinaryKeychain returns a *Keychain pointed at a path where no
 // executable exists, so that running it fails before any process starts.
 func newMissingBinaryKeychain(t *testing.T) *Keychain {
@@ -425,6 +493,14 @@ func TestGetUsername_UnparsableOutput(t *testing.T) {
 // TestGetUsername_MalformedHexAcct covers a hex-encoded "acct" that does not
 // decode. hexDecode's error used to be dropped on the floor and the loop
 // continued, ending in *ErrNotFound (issue #36, S3).
+//
+// The reason must name the actual cause (issue #45, item 2). With the S3 fix
+// reverted — the loop swallowing hexDecode's error and continuing instead of
+// returning it — parseAccount still falls off the end of the loop and returns
+// `no "acct" attribute in security output`, which GetUsername still wraps as
+// *ErrUnavailable. Asserting only the type, as this test used to, cannot tell
+// that "no attribute" cover story apart from the real "malformed hex"
+// diagnosis, so the S3 fix could regress silently underneath a green test.
 func TestGetUsername_MalformedHexAcct(t *testing.T) {
 	t.Parallel()
 	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
@@ -432,7 +508,10 @@ func TestGetUsername_MalformedHexAcct(t *testing.T) {
 	})
 
 	_, err := k.GetUsername("example-service")
-	assertUnavailable(t, "GetUsername() on a malformed hex acct attribute", err)
+	unavailable := assertUnavailable(t, "GetUsername() on a malformed hex acct attribute", err)
+	if !strings.Contains(unavailable.Reason, "malformed hex") {
+		t.Errorf("ErrUnavailable.Reason = %q, want it to name the malformed hex attribute rather than report a bare absence", unavailable.Reason)
+	}
 }
 
 // TestGetUsername_EmptyAccount covers an item whose account attribute is
@@ -583,6 +662,15 @@ func TestFindPassword_QueriesTheRequestedService(t *testing.T) {
 // empty-stderr branch of securityFailureDetail: with nothing on stderr, the
 // exit code is the only diagnostic there is, so the assertion below requires
 // it to reach the user.
+//
+// It also pins securityFailureDetail's `unlock-keychain` hint (issue #45,
+// item 5). GetPassword's error never passes through keychainUnavailableReason
+// — that function's own, unconditional "if it is locked, run `security
+// unlock-keychain %s`" suffix belongs to IsAvailable's diagnostic alone — so
+// the only way this Reason can contain the hint text is if
+// securityFailureDetail itself still appends it for exit 152. Removing that
+// suffix in production leaves this test's exit-code assertion above green but
+// fails the one below.
 func TestGetPassword_DoesNotFallBackAfterRealFailure(t *testing.T) {
 	t.Parallel()
 	k := newStandInKeychain(t, standInTimeout, map[string]securityResponse{
@@ -597,6 +685,9 @@ func TestGetPassword_DoesNotFallBackAfterRealFailure(t *testing.T) {
 	unavailable := assertUnavailable(t, "GetPassword() against a locked-keychain exit", err)
 	if !strings.Contains(unavailable.Reason, strconv.Itoa(securityLockedExitCode)) {
 		t.Errorf("ErrUnavailable.Reason = %q, want it to name the observed exit code %d", unavailable.Reason, securityLockedExitCode)
+	}
+	if !strings.Contains(unavailable.Reason, "try `security unlock-keychain`") {
+		t.Errorf("ErrUnavailable.Reason = %q, want the securityFailureDetail unlock-keychain hint for a locked-keychain exit", unavailable.Reason)
 	}
 }
 
@@ -881,6 +972,25 @@ func TestIsAvailable_ReportsTheActualCause(t *testing.T) {
 			t.Errorf("Reason = %q, want it to name the security binary it could not run (%s)", unavailable.Reason, k.security)
 		}
 	})
+
+	// An unresponsive security binary names itself as a timeout rather than
+	// falling back to the same generic phrasing used for every other
+	// unclassified cause (issue #45, item 4). Checking for the bare substring
+	// "timeout" would not discriminate here: the underlying error text
+	// (errSecurityTimeout wrapped with the command and configured duration)
+	// already contains that word regardless of which branch produced the
+	// final message, since the generic fallback interpolates the same
+	// wrapped error via %v. What is unique to the correct classification is
+	// keychainTimeoutReason's own phrasing, which the fallback never
+	// produces.
+	t.Run("an unresponsive keychain names it as a timeout", func(t *testing.T) {
+		t.Parallel()
+		k := newHangingKeychain(t)
+		unavailable := assertUnavailable(t, "IsAvailable() against an unresponsive security binary", k.IsAvailable())
+		if !strings.Contains(unavailable.Reason, "agent able to answer") {
+			t.Errorf("Reason = %q, want it to name the timeout rather than fall back to the generic could-not-open phrasing", unavailable.Reason)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1097,34 @@ func TestDelete_UnresponsiveKeychain(t *testing.T) {
 		t.Fatalf("Delete() took %s against an unresponsive security binary, want it bounded near the %s timeout (limit %s)", elapsed, hangTimeout, limit)
 	}
 	assertUnavailable(t, "Delete() against an unresponsive security binary", err)
+}
+
+// TestRunSecurity_WaitDelayBoundsGrandchildHoldingPipe pins the mechanism
+// securityWaitDelay actually exists for (issue #45, item 1). It does not use
+// newHangingKeychain: that stand-in's `exec sleep 300` makes sleep the direct
+// child, so killing it closes the pipes directly and the guard is never
+// exercised. Here the direct child (the shell) exits on its own — nothing is
+// killed, and k.timeout's context deadline never fires — while a backgrounded
+// grandchild keeps the inherited stdout/stderr pipes open. Removing
+// `cmd.WaitDelay = securityWaitDelay` from runSecurity leaves this test green
+// against every other case in this file, but makes GetPassword here take the
+// full grandchildHangSeconds instead of stopping near securityWaitDelay.
+func TestRunSecurity_WaitDelayBoundsGrandchildHoldingPipe(t *testing.T) {
+	t.Parallel()
+	k := newGrandchildHangingKeychain(t)
+
+	start := time.Now()
+	_, err := k.GetPassword("example-service")
+	elapsed := time.Since(start)
+
+	// Comfortably over securityWaitDelay (so the correctly-guarded call, which
+	// stops close to it plus process-scheduling slack, never flakes) and
+	// comfortably under grandchildHangSeconds (so a regression is caught in
+	// well under the full sleep rather than at it).
+	if limit := 10 * securityWaitDelay; elapsed > limit {
+		t.Fatalf("GetPassword() took %s against a grandchild holding the inherited pipe, want it bounded near securityWaitDelay (%s) (limit %s)", elapsed, securityWaitDelay, limit)
+	}
+	assertUnavailable(t, "GetPassword() against a grandchild holding the inherited pipe", err)
 }
 
 // ---------------------------------------------------------------------------
