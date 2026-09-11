@@ -25,7 +25,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&forceKeychain, "keychain", "k", false,
 		"use the Keychain backend (login.keychain-db via /usr/bin/security) — this is the default; the flag is a no-op kept for backward compatibility")
 	rootCmd.PersistentFlags().BoolVar(&forcePasswordsApp, "passwords-app", false,
-		"opt into the legacy Passwords.app backend instead of the Keychain default; NOTE: credentials it stores are ACL-bound to the creating binary, so `secret` and `git-credential-secret` cannot read each other's passwords back (issue #44)")
+		"opt into the legacy Passwords.app backend instead of the Keychain default; NOTE: credentials it stores are ACL-bound to the creating binary, so secret and git-credential-secret cannot read each other's passwords back (issue #44)")
 }
 
 // selectBackend returns Keychain unless --passwords-app explicitly opts

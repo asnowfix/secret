@@ -182,6 +182,31 @@ secret --passwords-app password myservice
 secret --passwords-app set myservice user pass
 ```
 
+### Upgrading from a pre-#44 version
+
+Before [#44](https://github.com/asnowfix/secret/issues/44), `PasswordsApp` was the macOS default. If you upgrade across that change, credentials stored under the old default are still there but not readable under the new one:
+
+```
+$ secret list | grep myservice
+myservice
+$ secret password myservice
+*** keychain unavailable: ... timeout 5s ...
+```
+
+**Why**: the item is ACL-bound to the `PasswordsApp`-era binary that created it (that binding is exactly what #44 fixes going forward); `/usr/bin/security`, which the new `Keychain` default reads through, is not on that item's ACL. Both `secret login` and `secret password` for that service time out (~5s each) rather than succeeding or reporting a clean miss — the Keychain backend's `find-generic-password` needs authorization for both, unlike `PasswordsApp`'s own attribute-vs-data split. `secret list` is unaffected: it parses `security dump-keychain`, which reads metadata without needing that authorization.
+
+**Nothing is lost, and no data is at risk**: plain `secret set -y myservice ...` against that service refuses rather than risking an overwrite, since it cannot confirm one way or the other whether a credential already exists there (the same guard issue #30 added, doing exactly its job here — it cannot tell "not there" apart from "there but unreadable", so it declines rather than guessing). `secret delete myservice`, on the other hand, succeeds even while the item is in this state — deleting does not need the data access the ACL is blocking — so a plain `secret set` does not become safe until the stale entry is removed first. The old value itself is still readable with the old backend throughout.
+
+**Recovery** (one-time, per affected service, no new tooling required):
+
+```sh
+secret --passwords-app password myservice          # read the old value out
+secret delete myservice                            # remove the ACL-bound entry (this succeeds)
+secret set -y myservice <account> <password-just-read>   # re-store under the new default
+```
+
+The delete step matters: skipping it and going straight to `secret set -y` hits the refusal above, because the stale entry is still there and still unreadable to the check `set` makes first. After the three steps above, `secret password myservice` (no flag) reads it back normally, and it is readable from `git-credential-secret` too.
+
 ### Windows Credential Manager
 
 Credentials are stored as **Generic** entries (`CRED_TYPE_GENERIC`) with machine-level persistence (`CRED_PERSIST_LOCAL_MACHINE`), making them available to all processes on the machine under the current user account.
