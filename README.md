@@ -22,12 +22,12 @@ Provide a single `secret` binary that works identically across macOS, Linux, and
 └────┬──────────┬──────────┬──────────┬───────────┘
      │          │          │          │
      ▼          ▼          ▼          ▼
-Passwords.app  Keychain  Win Cred  libsecret
-(macOS 15+)   (macOS,   (Windows)  (Linux,
-              fallback)             planned)
+Keychain     Passwords.app  Win Cred  libsecret
+(macOS,      (macOS 15+,    (Windows)  (Linux,
+default)     opt-in)                   planned)
 ```
 
-Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`). On macOS, `selectBackend()` prefers `PasswordsApp` when available and falls back to `Keychain`; pass `--keychain` / `-k` to force the fallback at runtime.
+Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`). On macOS, `selectBackend()` returns `Keychain` by default; pass `--passwords-app` to opt into the legacy `PasswordsApp` backend instead (not recommended — see the "macOS — Passwords.app" section below). `-k` / `--keychain` is still accepted for backward compatibility but is a no-op now that `Keychain` is the default.
 
 ## Installation
 
@@ -145,15 +145,23 @@ Under WSL, a WSL-built `git-credential-secret` trampolines to `git-credential-se
 
 | Backend | Platform | Status |
 |---------|----------|--------|
-| Passwords.app (Security framework, cgo) | macOS 15+ | Implemented — default on macOS 15+ |
-| macOS Keychain (`/usr/bin/security`) | macOS | Implemented — fallback on macOS < 15; selectable via `--keychain` |
+| macOS Keychain (`/usr/bin/security`) | macOS | Implemented — default (see [#44](https://github.com/asnowfix/secret/issues/44)); `--keychain`/`-k` still accepted, now a no-op |
+| Passwords.app (Security framework, cgo) | macOS 15+ | Implemented — opt-in via `--passwords-app`; not recommended, see below |
 | Windows Credential Manager | Windows | Implemented |
 | WSL trampoline → `secret.exe` / `git-credential-secret.exe` | WSL | Implemented |
 | GNOME libsecret / Secret Service (D-Bus) | Linux | Implemented — unverified on a real desktop, see below |
 | Passwords.app: Safari/iCloud credentials | macOS 15+ | Planned — requires code signing + entitlements ([#20](https://github.com/asnowfix/secret/issues/20)) |
 | KeePassXC | macOS, Linux, Windows | Planned |
 
-### macOS — Passwords.app (default on macOS 15+)
+### macOS — Keychain (default)
+
+Shells out to `/usr/bin/security` targeting `~/Library/Keychains/login.keychain-db`. This is the default macOS backend as of [#44](https://github.com/asnowfix/secret/issues/44): `Keychain.Add` passes `-T /usr/bin/security`, which grants the stored item non-interactive access to that fixed, stable binary rather than to whichever binary happened to create it. That is what makes `secret` and `git-credential-secret` able to read each other's credentials — a plain `SecItemAdd` (see PasswordsApp below) ACL-binds the item to the creating executable instead, and a cross-binary read of the password then fails.
+
+`secret list` parses `security dump-keychain` output for `svce`/`srvr` attributes, which is metadata visible without unlocking the keychain.
+
+`-k` / `--keychain` is still accepted on every command for backward compatibility with existing scripts, but is a no-op now that `Keychain` is the default — it used to force this backend over `PasswordsApp`; it still means "use Keychain", which now happens to be true unconditionally.
+
+### macOS — Passwords.app (opt-in, macOS 15+)
 
 Calls `SecItemCopyMatching`, `SecItemAdd`, and `SecItemDelete` from the Security framework directly via cgo. Unlike the Keychain backend, it does not hardcode `login.keychain-db` — it searches the default keychain list, which includes iCloud-synced items.
 
@@ -165,20 +173,14 @@ Both `kSecClassGenericPassword` (by `kSecAttrService`) and `kSecClassInternetPas
 
 > **Limitation**: credentials saved by Safari are stored in the data-protection keychain with access controls that block unsigned processes. `secret` can read and write credentials it manages itself; accessing Safari-saved credentials requires a signed binary with the `keychain-access-groups` entitlement ([#20](https://github.com/asnowfix/secret/issues/20)).
 
-#### Forcing the Keychain backend on macOS
+> **Interop warning ([#44](https://github.com/asnowfix/secret/issues/44))**: `PasswordsApp.Add` sets no `kSecAttrAccess`, so macOS ACL-binds each item it stores to the executable that created it. A credential stored by `secret --passwords-app set ...` will fail to read back its password from `git-credential-secret`, and vice versa — the username still round-trips (attribute reads are not ACL-gated), but the password does not. This is why `Keychain` is the default; opt into `PasswordsApp` only if you don't need `secret` and `git-credential-secret` to share credentials.
 
-Pass `--keychain` / `-k` to any command to route it through the `login.keychain-db` backend instead:
+Pass `--passwords-app` to any command to opt into this backend instead of the `Keychain` default:
 
 ```sh
-secret -k password myservice
-secret -k set myservice user pass
+secret --passwords-app password myservice
+secret --passwords-app set myservice user pass
 ```
-
-### macOS — Keychain (fallback / macOS < 15)
-
-Shells out to `/usr/bin/security` targeting `~/Library/Keychains/login.keychain-db`. Used automatically on macOS < 15, or when `--keychain` is passed.
-
-`secret list` parses `security dump-keychain` output for `svce`/`srvr` attributes, which is metadata visible without unlocking the keychain.
 
 ### Windows Credential Manager
 

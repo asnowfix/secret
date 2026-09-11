@@ -210,10 +210,23 @@ func classifySecurityError(service, op string, err error) error {
 }
 
 // keychainTimeoutReason builds the *ErrUnavailable diagnostic for a security
-// invocation that timed out, naming the likely cause (a locked keychain with
-// no agent able to answer an unlock prompt) rather than a generic failure.
+// invocation that timed out.
+//
+// It used to assert a single cause — "it may be locked with no agent able
+// to answer an unlock prompt" — unconditionally. That is wrong whenever the
+// real cause is an ACL authorization prompt instead (issue #44's PasswordsApp
+// items are ACL-bound to their creating binary; a cross-binary read raises
+// exactly this kind of prompt): measured hands-on on 2026-09-06, this
+// message fired while `security show-keychain-info` simultaneously reported
+// `no-timeout`, i.e. the keychain was demonstrably unlocked, and a user
+// following the suggested remedy unlocks a keychain that was never locked
+// and sees no improvement. A timeout at this call site cannot by itself
+// distinguish the two — both a lock-unlock prompt and an ACL prompt block
+// the same synchronous `security` invocation the same way — so the message
+// now names both plausible causes instead of asserting the one that used to
+// be printed unconditionally, and points at how to actually tell them apart.
 func keychainTimeoutReason(err error) string {
-	return fmt.Sprintf("keychain unavailable: %v — it may be locked with no agent able to answer an unlock prompt", err)
+	return fmt.Sprintf("keychain unavailable: %v — the security command did not respond in time, which can mean the keychain is locked with no agent able to answer an unlock prompt, or that a per-item access-control prompt is awaiting approval nothing can show; check `security show-keychain-info` for the lock state before assuming either", err)
 }
 
 func (k *Keychain) Add(service, account, password string) error {
