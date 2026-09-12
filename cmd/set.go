@@ -52,7 +52,18 @@ var setCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "*** %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "stored '%s' (account: %s) with non-interactive ACL\n", service, account)
+		// Deliberately not "... with non-interactive ACL": this command is
+		// shared by every backend on every platform, and that claim is only
+		// true of the macOS Keychain backend (Keychain.Add passes
+		// -T /usr/bin/security). There is no SecAccess / kSecAttrAccess /
+		// trusted-application code anywhere in backend/, so on PasswordsApp
+		// the claim was false — and false in exactly the reassuring
+		// direction a user must not be given, since PasswordsApp items are
+		// ACL-bound to the creating binary (issue #44). cmd/set.go has no
+		// backend-specific knowledge to condition the claim on, so the
+		// smallest correct fix is to stop making it here at all rather than
+		// plumb that knowledge in from a cross-platform command.
+		fmt.Fprintf(os.Stderr, "stored '%s' (account: %s)\n", service, account)
 		return nil
 	},
 }

@@ -983,11 +983,22 @@ func TestIsAvailable_ReportsTheActualCause(t *testing.T) {
 	// wrapped error via %v. What is unique to the correct classification is
 	// keychainTimeoutReason's own phrasing, which the fallback never
 	// produces.
+	//
+	// The assertion is on "access-control prompt" rather than the old
+	// "agent able to answer" substring: issue #44 fixed keychainTimeoutReason
+	// unconditionally blaming a lock for what can just as well be an ACL
+	// authorization prompt (measured hands-on with the keychain demonstrably
+	// unlocked per `security show-keychain-info`), so the message now hedges
+	// between both causes instead of asserting one. "access-control prompt"
+	// is still unique to keychainTimeoutReason's own phrasing — it never
+	// appears in errSecurityTimeout's wrapped text, so this still
+	// discriminates the timeout classification from the generic fallback the
+	// same way the old assertion did.
 	t.Run("an unresponsive keychain names it as a timeout", func(t *testing.T) {
 		t.Parallel()
 		k := newHangingKeychain(t)
 		unavailable := assertUnavailable(t, "IsAvailable() against an unresponsive security binary", k.IsAvailable())
-		if !strings.Contains(unavailable.Reason, "agent able to answer") {
+		if !strings.Contains(unavailable.Reason, "access-control prompt") {
 			t.Errorf("Reason = %q, want it to name the timeout rather than fall back to the generic could-not-open phrasing", unavailable.Reason)
 		}
 	})
