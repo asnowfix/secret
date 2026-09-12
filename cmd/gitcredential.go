@@ -161,8 +161,32 @@ func gitCredentialServiceKey(in gitCredentialInput) string {
 // returns 0 unless invoked with an operation git itself would never send —
 // see runGitCredentialHelper below for why a missing credential or an
 // unavailable backend must never be reported as a failure.
+//
+// This deliberately honours SECRET_BACKEND (issue #7's design question 5):
+// this binary never builds the Cobra command tree, so --passwords-app is
+// unreachable from it, but selectBackend() is the same shared function the
+// `secret` binary calls, and it was already going to vary by platform build
+// tag before this change — letting an environment variable vary it too adds
+// no new entry point to the security-sensitive "get" operation described in
+// this file's and cmd/git-credential-secret/main.go's package doc comments
+// (that boundary is about which *operations* are reachable only through
+// this binary, not about which backend answers them). Leaving it unhonoured
+// here instead would mean `secret set` and `git-credential-secret` could
+// silently disagree about which store is authoritative whenever
+// SECRET_BACKEND is set, which is a worse failure mode than a config
+// mistake surfacing as a diagnostic on stderr below.
 func RunGitCredentialHelper(op string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return runGitCredentialHelper(selectBackend(), op, stdin, stdout, stderr)
+	b, err := selectBackend()
+	if err != nil {
+		// Same reasoning as the ErrUnavailable case in
+		// runGitCredentialHelper: git ignores this helper's exit code and
+		// must fall through to its next configured helper or an
+		// interactive prompt rather than see a hard failure, so this is
+		// reported on stderr for a human, not surfaced as a non-zero exit.
+		fmt.Fprintf(stderr, "git-credential-secret: %v\n", err)
+		return 0
+	}
+	return runGitCredentialHelper(b, op, stdin, stdout, stderr)
 }
 
 // runGitCredentialHelper is RunGitCredentialHelper with the backend

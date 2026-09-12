@@ -22,7 +22,7 @@ This is a Cobra+Viper CLI (`main.go` → `cmd/` → `backend/`) that abstracts p
 
 **Key design decisions:**
 
-- **Platform selection is compile-time**: `cmd/backend_darwin.go`, `cmd/backend_linux.go`, `cmd/backend_windows.go` each provide `selectBackend()` gated by `//go:build` tags. New backends for a specific OS go in a file with the matching build tag.
+- **Backend availability is compile-time, selection is also runtime-overridable**: `cmd/backend_darwin.go`, `cmd/backend_linux.go`, `cmd/backend_windows.go` each provide `selectBackend() (backend.Backend, error)` gated by `//go:build` tags — which backends exist in a given binary is still fixed at compile time, and new backends for a specific OS still go in a file with the matching build tag. Within a build, `selectBackend()` reads the `SECRET_BACKEND` env var (via `viper.GetString("backend")`; `cmd/root.go`'s `init()` sets `SetEnvPrefix("SECRET")` + `AutomaticEnv()`) to pick among the backends available on that platform, defaulting to the platform default when unset and erroring on a value this platform does not recognise (see issue #7 and `cmd/backend_common.go`'s `errUnrecognisedBackend`). On macOS, `--passwords-app` still wins over `SECRET_BACKEND` when both are given.
 - **The macOS Keychain backend shells out to `/usr/bin/security`** rather than using cgo. This preserves ACL behavior (the `-T /usr/bin/security` flag grants non-interactive access).
 - **Backend interface** (`backend/backend.go`): all backends implement `IsAvailable`, `GetUsername`, `GetPassword`, `Add`, `Delete`, `Edit`, `List`. Return `*ErrNotFound` or `*ErrUnavailable` for typed error handling; `List` may additionally return `*ErrNotSupported` for backends that cannot enumerate at all.
 - **Runtime availability check**: `PersistentPreRunE` in the root command calls `b.IsAvailable()` before any subcommand runs (guards against locked keychains, missing daemons, etc.).
@@ -31,7 +31,7 @@ This is a Cobra+Viper CLI (`main.go` → `cmd/` → `backend/`) that abstracts p
 
 1. Create `backend/<name>.go` (with appropriate `//go:build` tag if platform-specific).
 2. Implement `backend.Backend`.
-3. Wire it into the appropriate `cmd/backend_<os>.go` file's `selectBackend()`.
+3. Wire it into the appropriate `cmd/backend_<os>.go` file's `selectBackend()`, giving it a `SECRET_BACKEND` name (add it to that file's `<os>BackendNames` slice and to `knownBackendNames` in `cmd/backend_common.go` so unrecognised-value errors on other platforms can name it correctly).
 
 ## Running CI steps locally
 

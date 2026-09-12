@@ -27,7 +27,26 @@ Keychain     Passwords.app  Win Cred  libsecret
 default)     opt-in)                   planned)
 ```
 
-Backend selection is compile-time via Go build tags (`darwin`, `linux`, `windows`). On macOS, `selectBackend()` returns `Keychain` by default; pass `--passwords-app` to opt into the legacy `PasswordsApp` backend instead (not recommended — see the "macOS — Passwords.app" section below). `-k` / `--keychain` is still accepted for backward compatibility but is a no-op now that `Keychain` is the default.
+Which backends are *available at all* is compile-time, via Go build tags (`darwin`, `linux`, `windows`) — a Linux binary has no Keychain code in it, for instance. Which one is *used* can be overridden at runtime with the `SECRET_BACKEND` environment variable; see [Backend selection](#backend-selection) below. On macOS, absent an override, `selectBackend()` returns `Keychain` by default; pass `--passwords-app` to opt into the legacy `PasswordsApp` backend instead (not recommended — see the "macOS — Passwords.app" section below). `-k` / `--keychain` is still accepted for backward compatibility but is a no-op now that `Keychain` is the default.
+
+## Backend selection
+
+Set `SECRET_BACKEND` to override the platform default at runtime, for both the `secret` CLI and `git-credential-secret`:
+
+```sh
+SECRET_BACKEND=passwords-app secret login my-service   # macOS: opt into the legacy Passwords.app backend
+SECRET_BACKEND=keychain secret login my-service         # macOS: Keychain, explicitly (same as the default)
+SECRET_BACKEND=credential-manager secret login my-service  # Windows: the only backend, spelled out explicitly
+SECRET_BACKEND=secret-service secret login my-service   # Linux (non-WSL): the only backend, spelled out explicitly
+```
+
+The accepted values are per-platform, because the backends themselves are behind Go build tags — `SECRET_BACKEND=secret-service` on macOS is rejected, not silently ignored, and the error says the name is valid on Linux rather than treating it as a plain typo. Any value this platform does not recognise at all is a hard error naming the accepted values, never a silent fall-back to the default.
+
+On macOS, `--passwords-app` takes precedence over `SECRET_BACKEND` when both are given: it is a deliberate, per-invocation flag, whereas the environment variable is typically inherited from a shell profile or CI environment set once for a whole session. When the flag is given, `SECRET_BACKEND` is not consulted at all — an unrelated value it happens to hold does not affect the outcome.
+
+Under WSL, `SECRET_BACKEND` is **not** consulted before the trampoline: the WSL-to-Windows re-exec (see [WSL](#wsl-windows-subsystem-for-linux) below) always runs first and unconditionally, and `syscall.Exec` passes the environment through unchanged, so a `SECRET_BACKEND` set on the WSL side reaches `secret.exe`/`git-credential-secret.exe` on the Windows host and is honoured there instead.
+
+`git-credential-secret` honours `SECRET_BACKEND` too, even though `--passwords-app` is unreachable from it (it never builds the Cobra command tree — see its own doc comment). Both binaries select a backend through the same shared function, so this keeps them from silently disagreeing about which store is authoritative when the variable is set.
 
 ## Installation
 

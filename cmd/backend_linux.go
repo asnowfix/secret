@@ -11,21 +11,42 @@ import (
 	"syscall"
 
 	"github.com/asnowfix/secret/backend"
+	"github.com/spf13/viper"
 )
 
-func selectBackend() backend.Backend {
+// linuxBackendNames lists the SECRET_BACKEND values accepted by the native
+// (non-WSL) Linux path, in display order for errUnrecognisedBackend.
+var linuxBackendNames = []string{"secret-service"}
+
+func selectBackend() (backend.Backend, error) {
 	// trampolineToWindows never returns: it either syscall.Execs onto this
 	// process's Windows-native counterpart on the host (secret.exe or
 	// git-credential-secret.exe, whichever this binary is — see
 	// trampolineTargetName below), or os.Exit(1)s. It must be tried first
 	// and unconditionally win over any native Linux backend — WSL users
 	// want the Windows host's credentials, not a WSL-local keyring, even
-	// if a Secret Service daemon happens to be running inside WSL.
+	// if a Secret Service daemon happens to be running inside WSL. This is
+	// also issue #7's design question 4: SECRET_BACKEND is deliberately
+	// *not* consulted here to suppress the trampoline. syscall.Exec passes
+	// os.Environ() through unchanged, so a SECRET_BACKEND set on the WSL
+	// side already reaches secret.exe/git-credential-secret.exe on the
+	// Windows host and is honoured there (see cmd/backend_windows.go) — the
+	// conservative behaviour that needs no maintainer decision. Making the
+	// variable suppress the trampoline instead would change a documented
+	// invariant ("must ... unconditionally win over any native Linux
+	// backend", above) and is out of scope for this change.
 	if isWSL() {
 		trampolineToWindows()
 	}
-	// Native Secret Service backend (GNOME Keyring, KWallet, ...).
-	return backend.NewSecretService()
+	// Native Secret Service backend (GNOME Keyring, KWallet, ...). Only one
+	// value is accepted today, but an unrecognised one is still a hard
+	// error rather than a silent fall-back (issue #7's design question 1).
+	switch name := viper.GetString("backend"); name {
+	case "", "secret-service":
+		return backend.NewSecretService(), nil
+	default:
+		return nil, errUnrecognisedBackend(name, "linux", linuxBackendNames)
+	}
 }
 
 func isWSL() bool {
