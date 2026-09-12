@@ -351,11 +351,28 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 //     on rather than guessed at.
 //
 // runGitCredentialHelper's IsAvailable check is no protection against any
-// of this: on the two backends most users are on it never touches the store
-// at all — CredentialManager, the only Windows backend, merely loads
-// advapi32, and PasswordsApp, the default on macOS 15+, merely stats the
-// app bundle — so a later indeterminate read does not mean the store became
-// unreadable mid-run. It may never have been established as readable.
+// of this, for two different reasons depending on backend (this paragraph
+// used to give one reason for both; it stopped being true for macOS once
+// #44 made Keychain the default there instead of PasswordsApp — the
+// conclusion survives, the premise below is corrected and now measured
+// rather than reasoned).
+//
+// On Windows, CredentialManager's IsAvailable merely loads advapi32 and
+// never touches the store at all, so it establishes nothing about any
+// particular credential — a later indeterminate read may never have had
+// anything to go stale from.
+//
+// On macOS, Keychain's IsAvailable shells out to `security
+// show-keychain-info`, which does touch the store — but only enough to
+// confirm the keychain itself is unlocked, not that any particular item is
+// readable. An item still ACL-bound to a different binary (issue #44,
+// including credentials stored under the pre-#44 PasswordsApp default) can
+// time out on its own find-generic-password call immediately afterward.
+// Measured 2026-09-11: IsAvailable passed (the keychain was genuinely
+// unlocked) while the very next per-item read against such a credential
+// timed out. So a passing IsAvailable establishes the keychain is open, not
+// that this item is readable — the argument is stronger here than on
+// Windows, not weaker, just for a different reason.
 //
 // Refusing has a cost of its own — git cannot clear a credential it knows
 // is bad, so it may keep retrying against the stale one — but it is
