@@ -160,7 +160,21 @@ func gitCredentialServiceKey(in gitCredentialInput) string {
 // (selectBackend, defined per-platform in cmd/backend_*.go) and always
 // returns 0 unless invoked with an operation git itself would never send —
 // see runGitCredentialHelper below for why a missing credential or an
-// unavailable backend must never be reported as a failure.
+// unavailable backend is reported on stderr rather than as a failing exit
+// code.
+//
+// That exit-0 choice is not forced by git: checked directly against git's
+// own source (v2.55.0, commit e9019fcafe; also current master,
+// 47ce80527c), `credential.c`'s three call sites
+// (credential_fill/credential_approve/credential_reject) all discard
+// credential_do()'s return value, and fall-through for "get" is driven
+// entirely by whether username=/password= came back on stdout, not by exit
+// status; for "store"/"erase" every configured helper always runs
+// regardless of output or exit code. Neither gitcredentials(7) nor
+// git-credential(1) documents an exit-code contract for get/store/erase
+// either. So git would behave identically here on exit 0 or exit 1 — this
+// binary returns 0 anyway, for consistency with the pre-existing
+// IsAvailable case below, which made the same choice first.
 //
 // This deliberately honours SECRET_BACKEND (issue #7's design question 5):
 // this binary never builds the Cobra command tree, so --passwords-app is
@@ -178,11 +192,10 @@ func gitCredentialServiceKey(in gitCredentialInput) string {
 func RunGitCredentialHelper(op string, stdin io.Reader, stdout, stderr io.Writer) int {
 	b, err := selectBackend()
 	if err != nil {
-		// Same reasoning as the ErrUnavailable case in
-		// runGitCredentialHelper: git ignores this helper's exit code and
-		// must fall through to its next configured helper or an
-		// interactive prompt rather than see a hard failure, so this is
-		// reported on stderr for a human, not surfaced as a non-zero exit.
+		// Same choice as the ErrUnavailable case in runGitCredentialHelper,
+		// for the same reason: see this function's doc comment above for
+		// why exit 0 here is a house convention, not something git's
+		// credential-helper protocol requires.
 		fmt.Fprintf(stderr, "git-credential-secret: %v\n", err)
 		return 0
 	}
@@ -196,12 +209,16 @@ func runGitCredentialHelper(b backend.Backend, op string, stdin io.Reader, stdou
 	if err := b.IsAvailable(); err != nil {
 		// From git's point of view, a backend that cannot be reached right
 		// now (locked keychain, no D-Bus session, ...) is indistinguishable
-		// from "no credential found": either way, git must fall through to
-		// the next configured helper or to an interactive prompt, never see
-		// a hard failure from this one. Reported on stderr for a human
-		// debugging the helper directly; ErrUnavailable's Reason is a fixed,
-		// backend-authored diagnostic string and never derived from a
-		// credential value, so it is safe to print here.
+		// from "no credential found": either way git falls through to the
+		// next configured helper or to an interactive prompt on stdout
+		// output alone, regardless of this helper's exit code (see
+		// RunGitCredentialHelper's doc comment above for the git-source
+		// verification behind that statement). Exit 0 here is this file's
+		// own convention for that reason, not a protocol requirement.
+		// Reported on stderr for a human debugging the helper directly;
+		// ErrUnavailable's Reason is a fixed, backend-authored diagnostic
+		// string and never derived from a credential value, so it is safe
+		// to print here.
 		fmt.Fprintf(stderr, "git-credential-secret: backend unavailable: %v\n", err)
 		return 0
 	}
