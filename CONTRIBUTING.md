@@ -24,7 +24,7 @@ After installation, verify the tools are on your `PATH`:
 go version && git --version && gh --version && goreleaser --version
 ```
 
-No extra C toolchain configuration is required — the macOS backend calls the built-in `/usr/bin/security` CLI via `os/exec` (`CGO_ENABLED=0`).
+The default `Keychain` backend calls the built-in `/usr/bin/security` CLI via `os/exec` and needs no C toolchain at runtime, but the opt-in `PasswordsApp` backend (`--passwords-app`) is compiled into every macOS build via cgo (`backend/passwords_app.go`, `#cgo LDFLAGS: -framework Security -framework CoreFoundation`) — so a plain `go build .` still needs `CGO_ENABLED=1` (the default) and the Xcode Command Line Tools installed above; `CGO_ENABLED=0 go build .` fails to compile.
 
 ## Prerequisites — Windows
 
@@ -88,7 +88,7 @@ go vet ./...
 go test ./...
 ```
 
-There is no test suite yet, so `go test` passes trivially. Adding tests alongside your change is welcome but not required.
+`go test ./...` runs the real unit test suite for `cmd/` and `backend/` (~9s). Adding tests alongside your change is expected for new logic, not just welcome.
 
 ## Manual smoke test (Windows)
 
@@ -180,4 +180,4 @@ goreleaser release --snapshot --clean --skip=publish   # build all artefacts wit
    ```
    `--fill` pre-populates the PR body from `.github/PULL_REQUEST_TEMPLATE.md`. Fill in all sections before submitting.
 
-4. Wait for CI green on both `windows-latest` and `macos-latest` before requesting review.
+4. Wait for CI green on `windows-latest`, `macos-latest`, and `ubuntu-latest` before requesting review.

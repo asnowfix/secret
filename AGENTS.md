@@ -10,7 +10,12 @@ go install .        # installs to $GOPATH/bin
 go run . <command>  # run without installing
 ```
 
-Cross-compile check (no tests yet):
+Run the test suite:
+```sh
+go test ./...       # unit tests for cmd/ and backend/, ~9s
+```
+
+Cross-compile check:
 ```sh
 GOOS=linux go build ./...
 GOOS=windows go build ./...
