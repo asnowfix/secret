@@ -73,7 +73,19 @@ func selectBackend() (backend.Backend, error) {
 		validateBackendEnvIgnoredByFlag()
 		return backend.NewPasswordsApp(), nil
 	}
-	switch name := viper.GetString("backend"); name {
+	return resolveBackendName(viper.GetString("backend"))
+}
+
+// resolveBackendName is the single source of truth for "which SECRET_BACKEND
+// values darwin accepts": it is the only place that lists them, and both
+// selectBackend's normal (non-flag) path and validateBackendEnvIgnoredByFlag
+// below call it, so the two cannot drift apart the way darwinBackendNames
+// and this switch once could (see the review that added this function:
+// validateBackendEnvIgnoredByFlag originally carried its own hand-written
+// copy of this switch's cases, a fourth hand-synchronised list alongside
+// the three "must fix 1" in PR #63's review already addressed).
+func resolveBackendName(name string) (backend.Backend, error) {
+	switch name {
 	case "":
 		return backend.NewKeychain(), nil
 	case "keychain":
@@ -88,20 +100,19 @@ func selectBackend() (backend.Backend, error) {
 // validateBackendEnvIgnoredByFlag reports, on stderr, a SECRET_BACKEND
 // value that --passwords-app is about to override without ever reading —
 // see selectBackend's doc comment above for why the flag still wins
-// unconditionally. This only fires for a value selectBackend would
-// otherwise reject outright (i.e. errUnrecognisedBackend's case); a value
-// that is merely a different valid choice than the flag's (e.g.
-// SECRET_BACKEND=keychain alongside --passwords-app) is the ordinary,
-// working precedence case and stays silent. A warning rather than an error
-// because the invocation must still succeed: the whole point of the flag
-// winning is that a script or alias with --passwords-app baked in keeps
-// working regardless of what an inherited environment variable holds.
+// unconditionally. It reuses resolveBackendName purely for its error,
+// discarding the backend, rather than re-deciding validity itself: that is
+// what keeps this path from being able to disagree with selectBackend's own
+// switch about which names are valid. A value that is merely a different
+// valid choice than the flag's (e.g. SECRET_BACKEND=keychain alongside
+// --passwords-app) resolves without error and stays silent — that's the
+// ordinary, working precedence case. A warning rather than an error because
+// the invocation must still succeed: the whole point of the flag winning is
+// that a script or alias with --passwords-app baked in keeps working
+// regardless of what an inherited environment variable holds.
 func validateBackendEnvIgnoredByFlag() {
-	switch name := viper.GetString("backend"); name {
-	case "", "keychain", "passwords-app":
-		return
-	default:
-		fmt.Fprintf(os.Stderr, "secret: warning: %v (ignored: --passwords-app was given)\n",
-			errUnrecognisedBackend(name, "darwin", darwinBackendNames))
+	name := viper.GetString("backend")
+	if _, err := resolveBackendName(name); err != nil {
+		fmt.Fprintf(os.Stderr, "secret: warning: %v (ignored: --passwords-app was given)\n", err)
 	}
 }

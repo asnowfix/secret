@@ -80,15 +80,16 @@ func TestSelectBackend_Darwin_UnrecognisedEnvValueErrors(t *testing.T) {
 
 // TestSelectBackend_Darwin_AllOwnNamesAccepted is the intra-platform
 // consistency check for "must fix 1" in the PR #63 review: darwinBackendNames
-// and selectBackend()'s switch cases are two hand-written lists in the same
-// file that must agree, and nothing previously checked that they did. This
-// catches the direction that is fully verifiable in a single build: a name
-// present in darwinBackendNames (so errUnrecognisedBackend would advertise
-// it as valid) but missing, misspelled, or removed from the switch (so
-// selectBackend() would actually reject it). It cannot catch the reverse —
-// a switch case with no matching slice entry — because that isn't harmful
-// in the same way: it means the error message under-advertises a name
-// selectBackend() actually accepts, not that it wrongly claims one works.
+// and resolveBackendName's switch cases are two hand-written lists in the
+// same file that must agree, and nothing previously checked that they did.
+// This catches the direction that is fully verifiable in a single build: a
+// name present in darwinBackendNames (so errUnrecognisedBackend would
+// advertise it as valid) but missing, misspelled, or removed from the
+// switch (so selectBackend() would actually reject it). It cannot catch the
+// reverse — a switch case with no matching slice entry — because that isn't
+// harmful in the same way: it means the error message under-advertises a
+// name selectBackend() actually accepts, not that it wrongly claims one
+// works.
 func TestSelectBackend_Darwin_AllOwnNamesAccepted(t *testing.T) {
 	for _, name := range darwinBackendNames {
 		t.Run(name, func(t *testing.T) {
@@ -250,6 +251,41 @@ func TestSelectBackend_Darwin_FlagSuppressesWarningForValidEnv(t *testing.T) {
 
 	if stderr != "" {
 		t.Errorf("expected no warning for a validly-named SECRET_BACKEND value, got %q", stderr)
+	}
+}
+
+// TestSelectBackend_Darwin_FlagPathSilentForAllOwnNames is the mirror of
+// TestSelectBackend_Darwin_AllOwnNamesAccepted for the flag-validation path:
+// it is the test that would have caught validateBackendEnvIgnoredByFlag
+// originally carrying its own hand-written copy of darwinBackendNames'
+// cases, a fourth hand-synchronised list this file no longer has now that
+// validateBackendEnvIgnoredByFlag calls resolveBackendName instead of
+// re-deciding validity itself. Every name darwinBackendNames advertises as
+// valid must produce no warning on the --passwords-app path, exactly as it
+// produces no error on the plain path.
+func TestSelectBackend_Darwin_FlagPathSilentForAllOwnNames(t *testing.T) {
+	for _, name := range darwinBackendNames {
+		t.Run(name, func(t *testing.T) {
+			resetDarwinBackendOverrides(t)
+			forcePasswordsApp = true
+			t.Setenv("SECRET_BACKEND", name)
+
+			var b backend.Backend
+			stderr := captureStderr(t, func() {
+				var err error
+				b, err = selectBackend()
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			})
+
+			if _, ok := b.(*backend.PasswordsApp); !ok {
+				t.Fatalf("got %T, want *backend.PasswordsApp (flag must still win)", b)
+			}
+			if stderr != "" {
+				t.Errorf("selectBackend() warned about %q, which darwinBackendNames claims is valid on darwin: %q", name, stderr)
+			}
+		})
 	}
 }
 
