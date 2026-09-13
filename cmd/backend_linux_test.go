@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -90,6 +91,72 @@ func TestSelectBackend_Linux_UnrecognisedEnvValueErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "typo") {
 		t.Errorf("error %q does not name the offending value", err.Error())
+	}
+}
+
+// TestSelectBackend_Linux_AllOwnNamesAccepted is the intra-platform
+// consistency check for "must fix 1" in the PR #63 review — see the darwin
+// equivalent (TestSelectBackend_Darwin_AllOwnNamesAccepted) for the full
+// rationale, which applies identically here: linuxBackendNames and
+// selectBackend()'s switch cases are hand-written lists in the same file
+// that must agree, and this catches a name the slice claims is valid on
+// linux but that the switch actually rejects.
+func TestSelectBackend_Linux_AllOwnNamesAccepted(t *testing.T) {
+	for _, name := range linuxBackendNames {
+		t.Run(name, func(t *testing.T) {
+			skipOnWSL(t)
+			t.Setenv("SECRET_BACKEND", name)
+
+			if _, err := selectBackend(); err != nil {
+				t.Fatalf("selectBackend() rejected %q, which linuxBackendNames claims is valid on linux: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestSelectBackend_Linux_UnrecognisedEnvValueNamesThisPlatform mirrors
+// TestSelectBackend_Darwin_UnrecognisedEnvValueNamesThisPlatform: it asserts
+// selectBackend() threads this file's own linuxBackendNames (not some other
+// platform's names slice) into errUnrecognisedBackend. A plain typo is used
+// because the ", not <goos>" half of the message only appears on the "valid
+// elsewhere" branch — see
+// TestSelectBackend_Linux_ValueValidOnlyOnAnotherPlatform below for that.
+func TestSelectBackend_Linux_UnrecognisedEnvValueNamesThisPlatform(t *testing.T) {
+	skipOnWSL(t)
+	t.Setenv("SECRET_BACKEND", "typo")
+
+	_, err := selectBackend()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, strings.Join(linuxBackendNames, ", ")) {
+		t.Errorf("error %q does not list linuxBackendNames verbatim — selectBackend() may be threading the wrong names slice into errUnrecognisedBackend", msg)
+	}
+}
+
+// TestSelectBackend_Linux_ValueValidOnlyOnAnotherPlatform mirrors
+// TestSelectBackend_Windows_ValueValidOnlyOnAnotherPlatform, which was the
+// only platform with this end-to-end case before the PR #63 review pointed
+// out darwin and linux lacked it. It also covers the ", not <goos>" half of
+// the message, comparing against runtime.GOOS (not a hardcoded "linux"
+// string) so a call site that accidentally hardcodes the wrong GOOS literal
+// fails this test when it runs on linux, which is the only platform this
+// file builds on.
+func TestSelectBackend_Linux_ValueValidOnlyOnAnotherPlatform(t *testing.T) {
+	skipOnWSL(t)
+	t.Setenv("SECRET_BACKEND", "keychain")
+
+	_, err := selectBackend()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "only available on darwin") {
+		t.Errorf("error %q does not explain that this name is valid on a different platform", msg)
+	}
+	if !strings.Contains(msg, ", not "+runtime.GOOS) {
+		t.Errorf("error %q does not say \", not %s\" — selectBackend() may be passing the wrong GOOS literal to errUnrecognisedBackend", msg, runtime.GOOS)
 	}
 }
 

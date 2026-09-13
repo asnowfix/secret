@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"bytes"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -72,6 +73,80 @@ func TestSelectBackend_Darwin_UnrecognisedEnvValueErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "typo") {
 		t.Errorf("error %q does not name the offending value", err.Error())
+	}
+}
+
+// TestSelectBackend_Darwin_AllOwnNamesAccepted is the intra-platform
+// consistency check for "must fix 1" in the PR #63 review: darwinBackendNames
+// and selectBackend()'s switch cases are two hand-written lists in the same
+// file that must agree, and nothing previously checked that they did. This
+// catches the direction that is fully verifiable in a single build: a name
+// present in darwinBackendNames (so errUnrecognisedBackend would advertise
+// it as valid) but missing, misspelled, or removed from the switch (so
+// selectBackend() would actually reject it). It cannot catch the reverse —
+// a switch case with no matching slice entry — because that isn't harmful
+// in the same way: it means the error message under-advertises a name
+// selectBackend() actually accepts, not that it wrongly claims one works.
+func TestSelectBackend_Darwin_AllOwnNamesAccepted(t *testing.T) {
+	for _, name := range darwinBackendNames {
+		t.Run(name, func(t *testing.T) {
+			resetDarwinBackendOverrides(t)
+			t.Setenv("SECRET_BACKEND", name)
+
+			if _, err := selectBackend(); err != nil {
+				t.Fatalf("selectBackend() rejected %q, which darwinBackendNames claims is valid on darwin: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestSelectBackend_Darwin_UnrecognisedEnvValueNamesThisPlatform closes the
+// other test-coverage gap the review flagged alongside "must fix 1": nothing
+// asserted that selectBackend()'s call to errUnrecognisedBackend passes its
+// own darwinBackendNames slice, rather than some other platform's copy-pasted
+// by mistake at the call site. A plain typo (one errUnrecognisedBackend does
+// not recognise as valid on any platform) is used here rather than a value
+// valid elsewhere, because the ", not <goos>" half of the message only
+// appears on the "valid elsewhere" branch — see
+// TestSelectBackend_Darwin_ValueValidOnlyOnAnotherPlatform below for that.
+func TestSelectBackend_Darwin_UnrecognisedEnvValueNamesThisPlatform(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	t.Setenv("SECRET_BACKEND", "typo")
+
+	_, err := selectBackend()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, strings.Join(darwinBackendNames, ", ")) {
+		t.Errorf("error %q does not list darwinBackendNames verbatim — selectBackend() may be threading the wrong names slice into errUnrecognisedBackend", msg)
+	}
+}
+
+// TestSelectBackend_Darwin_ValueValidOnlyOnAnotherPlatform mirrors
+// TestSelectBackend_Windows_ValueValidOnlyOnAnotherPlatform, which was the
+// only platform with this end-to-end case before the PR #63 review pointed
+// out darwin and linux lacked it. It also covers the ", not <goos>" half of
+// the message, which only appears on this "valid elsewhere" branch (see
+// errUnrecognisedBackend): comparing against runtime.GOOS, rather than a
+// hardcoded "darwin" string, means a call site that accidentally hardcodes
+// the wrong GOOS literal — e.g. "linux" pasted into cmd/backend_darwin.go —
+// fails this test when it runs on darwin, which is the only platform this
+// file builds on.
+func TestSelectBackend_Darwin_ValueValidOnlyOnAnotherPlatform(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	t.Setenv("SECRET_BACKEND", "secret-service")
+
+	_, err := selectBackend()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "only available on linux") {
+		t.Errorf("error %q does not explain that this name is valid on a different platform", msg)
+	}
+	if !strings.Contains(msg, ", not "+runtime.GOOS) {
+		t.Errorf("error %q does not say \", not %s\" — selectBackend() may be passing the wrong GOOS literal to errUnrecognisedBackend", msg, runtime.GOOS)
 	}
 }
 

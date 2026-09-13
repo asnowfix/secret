@@ -31,7 +31,7 @@ This is a Cobra+Viper CLI (`main.go` → `cmd/` → `backend/`) that abstracts p
 
 1. Create `backend/<name>.go` (with appropriate `//go:build` tag if platform-specific).
 2. Implement `backend.Backend`.
-3. Wire it into the appropriate `cmd/backend_<os>.go` file's `selectBackend()`, giving it a `SECRET_BACKEND` name (add it to that file's `<os>BackendNames` slice and to `knownBackendNames` in `cmd/backend_common.go` so unrecognised-value errors on other platforms can name it correctly).
+3. Wire it into the appropriate `cmd/backend_<os>.go` file's `selectBackend()`, giving it a `SECRET_BACKEND` name (add it to that file's `<os>BackendNames` slice and to `knownBackendNames` in `cmd/backend_common.go` so unrecognised-value errors on other platforms can name it correctly). The `<os>BackendNames` slice is checked against `selectBackend()`'s own switch cases by that platform's `TestSelectBackend_<OS>_AllOwnNamesAccepted` test (`cmd/backend_<os>_test.go`) — both live in the same build, so if you add a name to one and forget the other, that test fails. `knownBackendNames` cannot be checked this way: the build-tag architecture means no single build can see another platform's switch, so keeping that one in sync across platforms is still on you (see its doc comment in `cmd/backend_common.go`).
 
 ## Running CI steps locally
 
