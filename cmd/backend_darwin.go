@@ -3,6 +3,9 @@
 package cmd
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/asnowfix/secret/backend"
 	"github.com/spf13/viper"
 )
@@ -44,9 +47,16 @@ var darwinBackendNames = []string{"keychain", "passwords-app"}
 // that silently overridden by an environment it doesn't control. This also
 // matches the conventional flag-over-env precedence Cobra/Viper CLIs
 // generally follow. Because the flag alone fully determines the outcome
-// when set, SECRET_BACKEND is not even consulted (or validated) in that
-// case — an unrelated typo in an inherited environment variable should not
-// break an invocation the flag already resolves unambiguously.
+// when set, SECRET_BACKEND does not affect it — an unrelated typo in an
+// inherited environment variable should not break an invocation the flag
+// already resolves unambiguously. SECRET_BACKEND is, however, still
+// validated on this path (see validateBackendEnvIgnoredByFlag below), and a
+// value this platform would otherwise reject is reported on stderr: without
+// that, a user with --passwords-app aliased in their shell profile could
+// carry a broken SECRET_BACKEND unnoticed for weeks, since --passwords-app
+// masks it, until git-credential-secret — which cannot take the flag at
+// all, by design — hits the same broken variable cold and reports it as a
+// hard error instead of a warning (see RunGitCredentialHelper).
 //
 // This is also what git-credential-secret gets: cmd/git-credential-secret/
 // main.go never builds the Cobra command tree, so forcePasswordsApp is
@@ -60,6 +70,7 @@ var darwinBackendNames = []string{"keychain", "passwords-app"}
 // than only the one that created them).
 func selectBackend() (backend.Backend, error) {
 	if forcePasswordsApp {
+		validateBackendEnvIgnoredByFlag()
 		return backend.NewPasswordsApp(), nil
 	}
 	switch name := viper.GetString("backend"); name {
@@ -71,5 +82,26 @@ func selectBackend() (backend.Backend, error) {
 		return backend.NewPasswordsApp(), nil
 	default:
 		return nil, errUnrecognisedBackend(name, "darwin", darwinBackendNames)
+	}
+}
+
+// validateBackendEnvIgnoredByFlag reports, on stderr, a SECRET_BACKEND
+// value that --passwords-app is about to override without ever reading —
+// see selectBackend's doc comment above for why the flag still wins
+// unconditionally. This only fires for a value selectBackend would
+// otherwise reject outright (i.e. errUnrecognisedBackend's case); a value
+// that is merely a different valid choice than the flag's (e.g.
+// SECRET_BACKEND=keychain alongside --passwords-app) is the ordinary,
+// working precedence case and stays silent. A warning rather than an error
+// because the invocation must still succeed: the whole point of the flag
+// winning is that a script or alias with --passwords-app baked in keeps
+// working regardless of what an inherited environment variable holds.
+func validateBackendEnvIgnoredByFlag() {
+	switch name := viper.GetString("backend"); name {
+	case "", "keychain", "passwords-app":
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "secret: warning: %v (ignored: --passwords-app was given)\n",
+			errUnrecognisedBackend(name, "darwin", darwinBackendNames))
 	}
 }

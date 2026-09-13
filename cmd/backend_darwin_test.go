@@ -4,6 +4,8 @@ package cmd
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -155,16 +157,99 @@ func TestSelectBackend_Darwin_FlagWinsOverEnv(t *testing.T) {
 	forcePasswordsApp = true
 	// A SECRET_BACKEND value that would itself be a hard error is set
 	// deliberately: design question 3 says the flag must fully determine
-	// the outcome, without even consulting (let alone validating) the env
-	// var, so this must not error.
+	// the *outcome* regardless of the env var, so this must not error (it
+	// is, however, still validated and reported on stderr as a warning —
+	// see TestSelectBackend_Darwin_FlagStillReportsBadEnvAsWarning below).
 	t.Setenv("SECRET_BACKEND", "typo")
 
-	b, err := selectBackend()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	var b backend.Backend
+	captureStderr(t, func() {
+		var err error
+		b, err = selectBackend()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 	if _, ok := b.(*backend.PasswordsApp); !ok {
 		t.Fatalf("got %T, want *backend.PasswordsApp (flag must win over SECRET_BACKEND)", b)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it. validateBackendEnvIgnoredByFlag (called from
+// selectBackend when forcePasswordsApp is set) writes straight to
+// os.Stderr rather than taking an io.Writer parameter, matching the
+// existing pattern in cmd/backend_linux.go's trampolineToWindows — both are
+// rare, non-protocol diagnostics with no caller that needs to capture them
+// outside a test.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = old })
+
+	fn()
+
+	w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	return buf.String()
+}
+
+// TestSelectBackend_Darwin_FlagStillReportsBadEnvAsWarning is the "would
+// like" item from the PR #63 review: --passwords-app must keep winning
+// unconditionally (TestSelectBackend_Darwin_FlagWinsOverEnv above), but a
+// SECRET_BACKEND value that would otherwise be a hard error should not go
+// completely unreported, or a user relying on --passwords-app (e.g. via a
+// shell alias) never learns their environment is broken until
+// git-credential-secret — which cannot take the flag — hits the same value
+// cold as a hard error instead of a warning.
+func TestSelectBackend_Darwin_FlagStillReportsBadEnvAsWarning(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	forcePasswordsApp = true
+	t.Setenv("SECRET_BACKEND", "typo")
+
+	var b backend.Backend
+	stderr := captureStderr(t, func() {
+		var err error
+		b, err = selectBackend()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	if _, ok := b.(*backend.PasswordsApp); !ok {
+		t.Fatalf("got %T, want *backend.PasswordsApp (flag must still win despite the warning)", b)
+	}
+	if !strings.Contains(stderr, "typo") {
+		t.Errorf("expected stderr to warn about the ignored SECRET_BACKEND value, got %q", stderr)
+	}
+}
+
+// TestSelectBackend_Darwin_FlagSuppressesWarningForValidEnv confirms the
+// warning is specific to a value selectBackend would otherwise reject: a
+// SECRET_BACKEND value that is simply a different, valid choice than the
+// flag's (the ordinary, working precedence case) must stay silent.
+func TestSelectBackend_Darwin_FlagSuppressesWarningForValidEnv(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	forcePasswordsApp = true
+	t.Setenv("SECRET_BACKEND", "keychain")
+
+	stderr := captureStderr(t, func() {
+		if _, err := selectBackend(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	if stderr != "" {
+		t.Errorf("expected no warning for a validly-named SECRET_BACKEND value, got %q", stderr)
 	}
 }
 
