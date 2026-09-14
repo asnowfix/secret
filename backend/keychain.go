@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // securityBinary is the path to the real Apple security CLI. It is a const:
@@ -46,6 +48,40 @@ const securityCommandTimeout = externalCallTimeout
 // close pipes still held open by any grandchild it left behind.
 const securityWaitDelay = time.Second
 
+// isInteractive reports whether this process can plausibly show something a
+// person is watching for right now, which is the precondition for deciding
+// that a security invocation should be given humanResponseTimeout
+// (timeouts.go) instead of securityCommandTimeout: there is no point
+// waiting two minutes for someone to answer a dialog if nobody is
+// positioned to see it was raised.
+//
+// It probes stderr, not stdin or stdout, and deliberately: this tool is
+// used as a git credential helper, where stdin and stdout are the pipes git
+// itself reads and writes as part of the credential protocol, so both are
+// pipes even when a human is sitting right at the terminal running `git
+// push`. stderr is not part of that protocol — it is the stream this
+// package already uses to talk to the user directly (see
+// validateBackendEnvIgnoredByFlag in cmd/) — and it is the one stream that
+// stays a terminal through `secret password foo | pbcopy` or a credential
+// helper invocation, and stays redirected through a cron job or a CI step
+// that did not attach one.
+//
+// It uses IoctlGetTermios rather than an os.Stat/ModeCharDevice check on
+// purpose: /dev/null is a character device, so that check calls a cron job
+// with stderr redirected to /dev/null interactive, which is exactly the
+// case this probe exists to exclude. IoctlGetTermios(TIOCGETA) succeeds
+// only for an actual tty.
+//
+// isInteractive is a var, not a plain func, so NewKeychain's wiring of
+// Keychain.promptTimeout can be tested without a real terminal or the
+// absence of one on the machine running `go test` — see
+// TestNewKeychain_PromptTimeout, which swaps this var rather than the
+// process's stderr.
+var isInteractive = func() bool {
+	_, err := unix.IoctlGetTermios(int(os.Stderr.Fd()), unix.TIOCGETA)
+	return err == nil
+}
+
 // errSecurityTimeout is runSecurity's sentinel for "the security process did
 // not finish within the configured timeout". It must never be treated as
 // errItemNotFound: an unresponsive keychain is not a confirmed absence, and
@@ -62,15 +98,33 @@ type Keychain struct {
 	// process-wide state.
 	security string
 	timeout  time.Duration
+	// promptTimeout bounds the calls that can raise a keychain-unlock or
+	// per-item access-control dialog (everything runSecurityPrompt is used
+	// for; see its doc comment for the exact list), in place of timeout.
+	// Zero means "same as timeout": that keeps every existing &Keychain{...}
+	// literal in this file's tests, which do not set it, byte-for-byte
+	// identical to the pre-#67 non-interactive behaviour, and keeps
+	// NewKeychain's own zero value (when isInteractive() is false) correct
+	// without a separate branch.
+	//
+	// NewKeychain sets this to humanResponseTimeout when isInteractive()
+	// reports a person is plausibly watching stderr; otherwise it leaves it
+	// zero, and runSecurityPrompt falls back to timeout, exactly as
+	// runSecurity always has.
+	promptTimeout time.Duration
 }
 
 func NewKeychain() *Keychain {
 	home, _ := os.UserHomeDir()
-	return &Keychain{
+	k := &Keychain{
 		keychainPath: filepath.Join(home, "Library", "Keychains", "login.keychain-db"),
 		security:     securityBinary,
 		timeout:      securityCommandTimeout,
 	}
+	if isInteractive() {
+		k.promptTimeout = humanResponseTimeout
+	}
+	return k
 }
 
 func (k *Keychain) IsAvailable() error {
@@ -147,7 +201,7 @@ func parseAttribute(re *regexp.Regexp, line string) (value string, ok bool, err 
 func (k *Keychain) GetUsername(service string) (string, error) {
 	output, err := k.findPassword(service, false)
 	if err != nil {
-		return "", classifySecurityError(service, "read", err)
+		return "", k.classifySecurityError(service, "read", err)
 	}
 	account, err := parseAccount(output)
 	if err != nil {
@@ -184,33 +238,46 @@ func parseAccount(output string) (string, error) {
 func (k *Keychain) GetPassword(service string) (string, error) {
 	output, err := k.findPassword(service, true)
 	if err != nil {
-		return "", classifySecurityError(service, "read", err)
+		return "", k.classifySecurityError(service, "read", err)
 	}
 	return strings.TrimRight(output, "\n"), nil
 }
 
-// classifySecurityError maps an error from runSecurity onto the Backend
-// error types callers switch on, mirroring classifyBusError (libsecret.go)
-// and classifyCredError (wincred.go). Only the definitive errItemNotFound
-// sentinel becomes *ErrNotFound; everything else — a timeout, a locked
-// keychain, a missing binary, an unexpected exit code — becomes
-// *ErrUnavailable, so "could not tell" is never reported as "not there".
+// classifySecurityError maps an error from runSecurity/runSecurityPrompt onto
+// the Backend error types callers switch on, mirroring classifyBusError
+// (libsecret.go) and classifyCredError (wincred.go). Only the definitive
+// errItemNotFound sentinel becomes *ErrNotFound; everything else — a
+// timeout, a locked keychain, a missing binary, an unexpected exit code —
+// becomes *ErrUnavailable, so "could not tell" is never reported as "not
+// there".
 //
 // op names the operation for the diagnostic ("read", "delete"); it does not
 // affect the returned type.
-func classifySecurityError(service, op string, err error) error {
+//
+// It is a method, not a plain function, only so its timeout branch can read
+// k.promptTimeout: every call site that reaches this function does so after
+// a runSecurityPrompt invocation (findPassword, Delete), so a timeout here
+// is always eligible for keychainPromptTimeoutReason's "no terminal
+// detected" hint, and only that method knows whether this Keychain actually
+// found one.
+func (k *Keychain) classifySecurityError(service, op string, err error) error {
 	switch {
 	case errors.Is(err, errItemNotFound):
 		return &ErrNotFound{Service: service}
 	case errors.Is(err, errSecurityTimeout):
-		return &ErrUnavailable{Reason: keychainTimeoutReason(err)}
+		return &ErrUnavailable{Reason: keychainPromptTimeoutReason(err, k.promptTimeout != 0)}
 	default:
 		return &ErrUnavailable{Reason: fmt.Sprintf("could not %s keychain item for %q: %v", op, service, err)}
 	}
 }
 
-// keychainTimeoutReason builds the *ErrUnavailable diagnostic for a security
-// invocation that timed out.
+// keychainTimeoutReason builds the *ErrUnavailable diagnostic for a
+// show-keychain-info invocation that timed out (via runSecurity, from
+// IsAvailable/keychainUnavailableReason). show-keychain-info cannot itself
+// raise a dialog (see its own comment in runSecurity), so unlike
+// keychainPromptTimeoutReason below there is no interactivity fact worth
+// adding here: the bound it hit is securityCommandTimeout regardless of
+// whether stderr is a terminal, so naming that would explain nothing.
 //
 // It used to assert a single cause — "it may be locked with no agent able
 // to answer an unlock prompt" — unconditionally. That is wrong whenever the
@@ -229,12 +296,44 @@ func keychainTimeoutReason(err error) string {
 	return fmt.Sprintf("keychain unavailable: %v — the security command did not respond in time, which can mean the keychain is locked with no agent able to answer an unlock prompt, or that a per-item access-control prompt is awaiting approval nothing can show; check `security show-keychain-info` for the lock state before assuming either", err)
 }
 
+// keychainPromptTimeoutReason builds the *ErrUnavailable diagnostic for a
+// runSecurityPrompt invocation that timed out (find-generic-password,
+// find-internet-password, add-generic-password, delete-generic-password,
+// delete-internet-password, dump-keychain — anything that can hand off to a
+// keychain-unlock or per-item access-control dialog). It shares
+// keychainTimeoutReason's base message unmodified: a timeout at this call
+// site still cannot distinguish an unlock prompt from an ACL prompt, for
+// the reasons keychainTimeoutReason's own doc comment gives, and #67 does
+// not change that.
+//
+// wasInteractive is k.promptTimeout != 0 at the call that timed out, i.e.
+// whether NewKeychain found a terminal on stderr and therefore gave this
+// call up to humanResponseTimeout instead of securityCommandTimeout. When
+// it is true the two extra minutes already gave a person, if one was
+// there, every reasonable chance to answer, so nothing more is known and
+// nothing more is said. When it is false the additional fact is worth
+// stating plainly: this process decided nobody was positioned to see a
+// prompt, bounded the call at securityCommandTimeout on that basis, and so
+// never actually waited out whatever raised it — which is otherwise
+// indistinguishable from every other short-bound machine-call timeout this
+// file can produce, and is exactly the "give me time to unlock" complaint
+// issue #67 was filed over, happening again for a different, well-founded
+// reason (a script's stderr genuinely is not a terminal) rather than the
+// original bug (a terminal's *was*, and got only 5 seconds anyway).
+func keychainPromptTimeoutReason(err error, wasInteractive bool) string {
+	reason := keychainTimeoutReason(err)
+	if wasInteractive {
+		return reason
+	}
+	return reason + fmt.Sprintf(" — stderr was not detected as a terminal, so this call was bounded at the machine timeout above rather than given up to %s to wait for a person to answer a prompt; rerun from an interactive terminal if one needs answering", humanResponseTimeout)
+}
+
 func (k *Keychain) Add(service, account, password string) error {
 	// -T names the real Apple binary deliberately, not k.security: the
 	// non-interactive ACL grant it creates is the entire reason this backend
 	// shells out to /usr/bin/security instead of using cgo (see AGENTS.md),
 	// so it must never follow the test seam.
-	_, err := k.runSecurity("add-generic-password",
+	_, err := k.runSecurityPrompt("add-generic-password",
 		"-s", service,
 		"-a", account,
 		"-w", password,
@@ -259,16 +358,16 @@ func (k *Keychain) Delete(service string) error {
 	// suppress *ErrNotFound from Delete entirely, so collapsing here makes
 	// `git credential reject` against a locked keychain report success having
 	// deleted nothing (issue #36; same bug class as #30).
-	_, err := k.runSecurity("delete-generic-password", "-s", service, k.keychainPath)
+	_, err := k.runSecurityPrompt("delete-generic-password", "-s", service, k.keychainPath)
 	if err == nil {
 		return nil
 	}
 	if !errors.Is(err, errItemNotFound) {
-		return classifySecurityError(service, "delete", err)
+		return k.classifySecurityError(service, "delete", err)
 	}
 
-	if _, err := k.runSecurity("delete-internet-password", "-s", service, k.keychainPath); err != nil {
-		return classifySecurityError(service, "delete", err)
+	if _, err := k.runSecurityPrompt("delete-internet-password", "-s", service, k.keychainPath); err != nil {
+		return k.classifySecurityError(service, "delete", err)
 	}
 	return nil
 }
@@ -286,7 +385,7 @@ func (k *Keychain) Edit() error {
 }
 
 func (k *Keychain) List() ([]string, error) {
-	out, err := k.runSecurity("dump-keychain", k.keychainPath)
+	out, err := k.runSecurityPrompt("dump-keychain", k.keychainPath)
 	if err != nil {
 		return nil, &ErrUnavailable{Reason: fmt.Sprintf("failed to list secrets: %v", err)}
 	}
@@ -390,6 +489,47 @@ var securityPasswordLine = regexp.MustCompile(`(?m)^password: .*$`)
 // security produced — plus the exit code itself, which is otherwise invisible
 // to the user and is the only handle on an unmodelled failure.
 //
+// Use this for a security subcommand that cannot raise a dialog —
+// show-keychain-info is currently the only one — so it must always fail fast
+// regardless of interactivity: IsAvailable calls it from PersistentPreRunE
+// ahead of every subcommand. Everything that can raise a keychain-unlock or
+// ACL dialog goes through runSecurityPrompt instead.
+func (k *Keychain) runSecurity(args ...string) (string, error) {
+	return k.runSecurityBounded(k.timeout, args...)
+}
+
+// runSecurityPrompt is runSecurity's counterpart for the security
+// subcommands that can hand off to a keychain-unlock or per-item
+// access-control dialog: find-generic-password, find-internet-password,
+// add-generic-password, delete-generic-password, delete-internet-password,
+// and dump-keychain. It is bounded by k.promptTimeout when that is set
+// (i.e. NewKeychain decided, via isInteractive, that someone is plausibly
+// watching stderr) and falls back to k.timeout — byte-for-byte the same
+// bound runSecurity uses — otherwise, so a non-interactive invocation (git
+// credential helper, cron, CI, an ssh session with no tty on stderr) is
+// unaffected by #67 and still fails within securityCommandTimeout.
+//
+// The known and accepted residual case is the inverse: an ssh session that
+// does have a tty on stderr, but nobody at the console to answer a dialog
+// it raises, now waits the full k.promptTimeout instead of failing in
+// k.timeout. isInteractive's doc comment and this package's PR record the
+// reasoning; in short, that costs latency on a path that was already
+// broken, whereas the 5s bound this replaces cost a user sitting right
+// there their credential on a path that was working, and the asymmetry is
+// the same one externalCallTimeout's own floor rests on (timeouts.go).
+func (k *Keychain) runSecurityPrompt(args ...string) (string, error) {
+	timeout := k.promptTimeout
+	if timeout == 0 {
+		timeout = k.timeout
+	}
+	return k.runSecurityBounded(timeout, args...)
+}
+
+// runSecurityBounded is the shared implementation behind runSecurity and
+// runSecurityPrompt: it runs the security CLI with the given arguments,
+// bounded by timeout, and classifies the result exactly as runSecurity's
+// doc comment describes.
+//
 // The child is bounded via exec.CommandContext rather than a bare
 // exec.Command, and WaitDelay bounds how long Wait will keep waiting on the
 // stdout/stderr pipes once the child is gone. Without WaitDelay that wait is
@@ -408,8 +548,8 @@ var securityPasswordLine = regexp.MustCompile(`(?m)^password: .*$`)
 // cancellation of a childless direct child. cmd.Stdin is left nil, i.e.
 // /dev/null, so the child can never block reading from an inherited terminal
 // either.
-func (k *Keychain) runSecurity(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+func (k *Keychain) runSecurityBounded(timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, k.security, args...)
@@ -419,7 +559,7 @@ func (k *Keychain) runSecurity(args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("%w (security %s, timeout %s)", errSecurityTimeout, args[0], k.timeout)
+			return "", fmt.Errorf("%w (security %s, timeout %s)", errSecurityTimeout, args[0], timeout)
 		}
 		msg := redactPasswords(strings.TrimSpace(stderr.String()))
 		exitCode := -1
@@ -480,7 +620,7 @@ func (k *Keychain) findPassword(service string, passwordOnly bool) (string, erro
 	// Try generic password first. A real failure here (not a "not found")
 	// means we cannot determine whether the item exists at all, so return
 	// immediately rather than masking it with an internet-password attempt.
-	out, err := k.runSecurity("find-generic-password", flag, "-s", service, k.keychainPath)
+	out, err := k.runSecurityPrompt("find-generic-password", flag, "-s", service, k.keychainPath)
 	if err == nil {
 		return out, nil
 	}
@@ -489,7 +629,7 @@ func (k *Keychain) findPassword(service string, passwordOnly bool) (string, erro
 	}
 
 	// Fall back to internet password.
-	return k.runSecurity("find-internet-password", flag, "-s", service, k.keychainPath)
+	return k.runSecurityPrompt("find-internet-password", flag, "-s", service, k.keychainPath)
 }
 
 func hexDecode(s string) (string, error) {

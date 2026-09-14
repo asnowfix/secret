@@ -1139,6 +1139,153 @@ func TestRunSecurity_WaitDelayBoundsGrandchildHoldingPipe(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Interactivity and the prompt timeout (issue #67)
+// ---------------------------------------------------------------------------
+
+// newHangingKeychainWithPromptTimeout is newHangingKeychain's counterpart
+// for exercising the choice runSecurityPrompt makes between k.timeout and
+// k.promptTimeout. Both bounds are supplied explicitly and kept short here —
+// unlike NewKeychain's real wiring, where the long bound is
+// humanResponseTimeout (2 minutes) — so that covering the choice between
+// them never sleeps anywhere near that long and never depends on whether
+// the machine running `go test` has a terminal on stderr: nothing here
+// calls NewKeychain or isInteractive at all.
+func newHangingKeychainWithPromptTimeout(t *testing.T, timeout, promptTimeout time.Duration) *Keychain {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "security")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 300\n"), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return &Keychain{
+		keychainPath:  filepath.Join(dir, "irrelevant.keychain-db"),
+		security:      binary,
+		timeout:       timeout,
+		promptTimeout: promptTimeout,
+	}
+}
+
+// TestNewKeychain_PromptTimeout pins NewKeychain's wiring of promptTimeout
+// to isInteractive's answer, without depending on whether the process
+// running the test actually has a terminal on stderr: isInteractive is a
+// var precisely so this test can substitute it instead of the real probe.
+//
+// It does not run t.Parallel(): it mutates the package-level isInteractive
+// var, and NewKeychain is the only production caller of it, but a parallel
+// sibling calling NewKeychain concurrently would race with the swap.
+func TestNewKeychain_PromptTimeout(t *testing.T) {
+	original := isInteractive
+	defer func() { isInteractive = original }()
+
+	isInteractive = func() bool { return true }
+	if k := NewKeychain(); k.promptTimeout != humanResponseTimeout {
+		t.Errorf("NewKeychain().promptTimeout = %s with isInteractive() = true, want humanResponseTimeout (%s)",
+			k.promptTimeout, humanResponseTimeout)
+	}
+
+	isInteractive = func() bool { return false }
+	if k := NewKeychain(); k.promptTimeout != 0 {
+		t.Errorf("NewKeychain().promptTimeout = %s with isInteractive() = false, want 0 (same as k.timeout)", k.promptTimeout)
+	}
+}
+
+// TestRunSecurityPrompt_PrefersPromptTimeoutOverTimeout proves
+// runSecurityPrompt actually bounds a prompting call by k.promptTimeout when
+// it is set, not merely that the code compiles: k.timeout is set far
+// shorter than k.promptTimeout, so a call that returned near k.timeout
+// instead would fail this test's lower bound.
+func TestRunSecurityPrompt_PrefersPromptTimeoutOverTimeout(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 50 * time.Millisecond
+		promptBound  = 400 * time.Millisecond
+	)
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, promptBound)
+
+	start := time.Now()
+	_, err := k.GetPassword("irrelevant")
+	elapsed := time.Since(start)
+
+	if elapsed < promptBound {
+		t.Errorf("GetPassword() returned after %s, want at least promptBound (%s): a prompting call must be bounded by k.promptTimeout, not k.timeout (%s)",
+			elapsed, promptBound, shortTimeout)
+	}
+	if limit := 5 * promptBound; elapsed > limit {
+		t.Fatalf("GetPassword() took %s against a hanging security binary, want it bounded near promptBound (%s) (limit %s)", elapsed, promptBound, limit)
+	}
+	assertUnavailable(t, "GetPassword() against a hanging security binary with promptTimeout set", err)
+}
+
+// TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout proves the
+// documented meaning of promptTimeout == 0: identical to k.timeout, which is
+// what every pre-#67 &Keychain{...} test literal in this file (none of
+// which set promptTimeout) has always gotten and must keep getting.
+func TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout(t *testing.T) {
+	t.Parallel()
+	const shortTimeout = 100 * time.Millisecond
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, 0)
+
+	start := time.Now()
+	_, err := k.GetPassword("irrelevant")
+	elapsed := time.Since(start)
+
+	if limit := 10 * shortTimeout; elapsed > limit {
+		t.Fatalf("GetPassword() took %s with promptTimeout=0, want it bounded near k.timeout (%s) (limit %s)", elapsed, shortTimeout, limit)
+	}
+	unavailable := assertUnavailable(t, "GetPassword() against a hanging security binary with promptTimeout=0", err)
+	if !strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want the non-interactive hint since promptTimeout=0 means isInteractive() found nothing", unavailable.Reason)
+	}
+}
+
+// TestIsAvailable_IgnoresPromptTimeout proves show-keychain-info stays on
+// the machine bound (k.timeout) regardless of k.promptTimeout: it is the
+// call IsAvailable makes from PersistentPreRunE ahead of every subcommand,
+// and per runSecurity's doc comment it cannot itself raise a dialog, so it
+// must keep failing fast even when this Keychain would give a prompting
+// call much longer.
+func TestIsAvailable_IgnoresPromptTimeout(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 50 * time.Millisecond
+		longPrompt   = 2 * time.Second
+	)
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, longPrompt)
+
+	start := time.Now()
+	err := k.IsAvailable()
+	elapsed := time.Since(start)
+
+	if limit := 10 * shortTimeout; elapsed > limit {
+		t.Fatalf("IsAvailable() took %s, want it bounded near k.timeout (%s) regardless of k.promptTimeout (%s) (limit %s)",
+			elapsed, shortTimeout, longPrompt, limit)
+	}
+	unavailable := assertUnavailable(t, "IsAvailable() against a hanging security binary with promptTimeout set", err)
+	if strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want no interactivity hint: show-keychain-info cannot raise a prompt, so the hint would explain nothing", unavailable.Reason)
+	}
+}
+
+// TestKeychainPromptTimeoutReason_InteractiveOmitsTerminalHint proves the
+// converse of TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout's
+// message assertion: when a prompting call had promptTimeout set (i.e. this
+// process did find a terminal on stderr) and still timed out, the message
+// says nothing about a missing terminal, because there was not one to
+// report missing — two minutes already gave a person, if one was there,
+// every reasonable chance to answer.
+func TestKeychainPromptTimeoutReason_InteractiveOmitsTerminalHint(t *testing.T) {
+	t.Parallel()
+	const promptBound = 100 * time.Millisecond
+	k := newHangingKeychainWithPromptTimeout(t, promptBound, promptBound)
+
+	_, err := k.GetPassword("irrelevant")
+	unavailable := assertUnavailable(t, "GetPassword() against a hanging security binary with promptTimeout set", err)
+	if strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want no non-interactive hint: promptTimeout was set, so a terminal was in fact detected", unavailable.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Opt-in tests against a real keychain
 // ---------------------------------------------------------------------------
 
@@ -1289,6 +1436,15 @@ func lockScratchKeychain(t *testing.T, path string) {
 // to securityWaitDelay for the inherited pipes to close, so the worst case a
 // caller can observe is the sum. Checking them individually would let the pair
 // drift back over the cap while each half still looked compliant.
+//
+// Keychain.promptTimeout is deliberately not checked here, mirroring how
+// TestDbusCallTimeoutRespectsCap (libsecret_test.go) exempts
+// promptWaitTimeout: when set, promptTimeout holds humanResponseTimeout,
+// which bounds a wait on a person rather than on the security process, and
+// timeouts.go excludes exactly that from maxExternalCallTimeout. Asserting
+// it here would encode the opposite rule; see
+// TestHumanResponseTimeoutExceedsExternalCallTimeout (timeouts_test.go) for
+// the check that does apply to it.
 func TestSecurityBoundsRespectCap(t *testing.T) {
 	t.Parallel()
 	if worst := securityCommandTimeout + securityWaitDelay; worst > maxExternalCallTimeout {

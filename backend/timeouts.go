@@ -34,6 +34,13 @@ import "time"
 // non-interactive contexts this tool runs in — git credential helper, cron,
 // CI, ssh — so those calls are in scope and are made to refuse the dialog
 // rather than wait behind it (see passwords_app.go).
+//
+// It also does not apply when a GUI dialog is raised but this process can
+// tell nobody is positioned to answer it, even though a human being is in
+// principle the thing being waited on. The Keychain backend (keychain.go)
+// decides that by probing whether stderr is a terminal; humanResponseTimeout
+// below is what it and libsecret.go's promptWaitTimeout apply once they have
+// decided someone plausibly is.
 const maxExternalCallTimeout = 7 * time.Second
 
 // externalCallTimeout is the default bound applied to external machine
@@ -74,3 +81,37 @@ const maxExternalCallTimeout = 7 * time.Second
 // range, there is nothing to buy by choosing 200ms over 5s, and something
 // real to lose.
 const externalCallTimeout = 5 * time.Second
+
+// humanResponseTimeout bounds a wait for a *person* to answer a prompt this
+// package cannot suppress — a Secret Service unlock/create dialog on Linux
+// (libsecret.go's promptWaitTimeout, which is this constant under its own,
+// call-site-specific name), or a macOS keychain-unlock or per-item
+// access-control dialog (keychain.go's Keychain.promptTimeout). It is
+// deliberately shared rather than reinvented per backend: the two dialogs
+// are the same kind of wait — read a prompt, type a password, click Allow —
+// and there is no argument on record for why a person would need more or
+// less time to do that depending on which OS raised the dialog.
+//
+// 2 minutes is not derived from a measurement the way externalCallTimeout
+// is; there is no "normal working time" for a human to take 2x of. It is
+// long enough to read an unfamiliar dialog and type a password once, short
+// enough that a command a user forgot they left waiting does not sit
+// unkillable indefinitely. It must stay well clear of
+// maxExternalCallTimeout on both sides of that judgment: it bounds a wait on
+// a person, not a machine, so maxExternalCallTimeout's rationale does not
+// apply to it at all (TestSecurityBoundsRespectCap and
+// TestDbusCallTimeoutRespectsCap both exempt it explicitly, mirroring each
+// other), and it must still clearly exceed externalCallTimeout or it would
+// buy nothing over the machine bound it is meant to replace.
+//
+// This value is applied only where the caller has also decided a human is
+// plausibly there to be waited on — an interactivity check, not a blanket
+// widening of every call's bound. See keychain.go's isInteractive for that
+// decision on macOS, and its doc comment for the one contested case: an ssh
+// session with a tty attached but nobody at the console now waits the full
+// 2 minutes instead of failing in 5 seconds, which this package accepts on
+// the same asymmetry argument externalCallTimeout's floor rests on (a bound
+// that is too long costs latency on a path that was already broken; a bound
+// that is too short costs a user their credential on a path that was
+// working) rather than on any claim that the ssh case is rare.
+const humanResponseTimeout = 2 * time.Minute
