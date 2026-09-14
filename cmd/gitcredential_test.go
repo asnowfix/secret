@@ -24,6 +24,12 @@ type fakeGitCredentialBackend struct {
 	// the read fail while the credential is still very much there.
 	usernameErr error
 
+	// passwordErr is usernameErr's counterpart for GetPassword: a username
+	// read can succeed while the password read still fails, on the macOS
+	// Keychain backend in particular (attribute reads are not ACL-gated,
+	// data reads are — issue #44).
+	passwordErr error
+
 	addCalls    []string
 	deleteCalls []string
 }
@@ -46,6 +52,9 @@ func (f *fakeGitCredentialBackend) GetUsername(service string) (string, error) {
 }
 
 func (f *fakeGitCredentialBackend) GetPassword(service string) (string, error) {
+	if f.passwordErr != nil {
+		return "", f.passwordErr
+	}
 	c, ok := f.creds[service]
 	if !ok {
 		return "", &backend.ErrNotFound{Service: service}
@@ -234,6 +243,57 @@ func TestRunGitCredentialHelper_Get(t *testing.T) {
 		}
 		if stdout.Len() != 0 {
 			t.Fatalf("got stdout %q, want empty", stdout.String())
+		}
+	})
+
+	// #68 review finding: before this, a lookup failure other than a plain
+	// miss (chiefly *backend.ErrUnavailable — after #67, up to
+	// humanResponseTimeout per call on macOS Keychain) was swallowed
+	// exactly like a miss, so `git push` behind an unanswered keychain
+	// prompt would hang for minutes and then fail with zero output tying
+	// the delay to the keychain.
+	t.Run("username read failure other than not-found is reported on stderr", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.usernameErr = &backend.ErrUnavailable{Reason: "keychain locked"}
+		var stdout, stderr bytes.Buffer
+		code := runGitCredentialHelper(b, "get", strings.NewReader("protocol=https\nhost=github.com\n\n"), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("got exit code %d, want 0", code)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("got stdout %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "keychain locked") {
+			t.Fatalf("got stderr %q, want it to report the lookup failure", stderr.String())
+		}
+	})
+
+	t.Run("password read failure other than not-found is reported on stderr", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"bob", "s3cr3t"}
+		b.passwordErr = &backend.ErrUnavailable{Reason: "keychain locked"}
+		var stdout, stderr bytes.Buffer
+		code := runGitCredentialHelper(b, "get", strings.NewReader("protocol=https\nhost=github.com\n\n"), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("got exit code %d, want 0", code)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("got stdout %q, want empty", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "keychain locked") {
+			t.Fatalf("got stderr %q, want it to report the lookup failure", stderr.String())
+		}
+	})
+
+	t.Run("a plain not-found username read stays silent on stderr", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		var stdout, stderr bytes.Buffer
+		code := runGitCredentialHelper(b, "get", strings.NewReader("protocol=https\nhost=github.com\n\n"), &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("got exit code %d, want 0", code)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("got stderr %q, want empty: a not-found read is a normal outcome", stderr.String())
 		}
 	})
 

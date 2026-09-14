@@ -3,6 +3,7 @@
 package backend
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestParseKeychainDumpServices(t *testing.T) {
@@ -305,21 +309,45 @@ attributes:
 // agent to answer: the real security binary does not hang because it is
 // blocked reading stdin (a nil cmd.Stdin has read from os.DevNull since
 // Go 1.0) — it hangs waiting on an interactive unlock prompt that nothing
-// will ever answer. Driving that through a stand-in exercises runSecurity's
-// own timeout/kill logic deterministically, without depending on real
-// keychain/agent behavior — which is exactly what hung CI for ten minutes and
-// left an orphan `security` process behind.
+// will ever answer. Driving that through a stand-in exercises
+// runSecurityBoundedCtx's own timeout/kill logic deterministically, without
+// depending on real keychain/agent behavior — which is exactly what hung CI
+// for ten minutes and left an orphan `security` process behind.
+//
+// It delegates to newHangingKeychainWithPromptTimeout with promptTimeout=0
+// rather than duplicating the stand-in script: this file makes an explicit
+// point elsewhere of not letting two things do the same job drift apart
+// (see attributeRegexp's comment on the two dump parsers), and this pair
+// used to be exactly that — byte-for-byte the same script-writing logic
+// with one field added.
 func newHangingKeychain(t *testing.T) *Keychain {
+	t.Helper()
+	return newHangingKeychainWithPromptTimeout(t, hangTimeout, 0)
+}
+
+// newHangingKeychainWithStderr is newHangingKeychain, except the stand-in
+// writes msg to stderr before it hangs — standing in for a real `security`
+// invocation that printed a diagnostic (e.g. "User interaction is not
+// allowed") before the deadline killed it, the scenario
+// runSecurityBoundedCtx's timeout branch must not discard.
+//
+// timeout is deliberately a parameter rather than the package's usual
+// hangTimeout: it has to be generous enough that `/bin/sh`'s own startup
+// plus the echo reliably completes before the deadline fires, or the test
+// would flake on exactly the race it is trying to pin down rather than
+// asserting the message-building logic.
+func newHangingKeychainWithStderr(t *testing.T, timeout time.Duration, msg string) *Keychain {
 	t.Helper()
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "security")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 300\n"), 0o755); err != nil {
+	script := fmt.Sprintf("#!/bin/sh\necho %q 1>&2\nexec sleep 300\n", msg)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatalf("write stand-in security script: %v", err)
 	}
 	return &Keychain{
 		keychainPath: filepath.Join(dir, "irrelevant.keychain-db"),
 		security:     binary,
-		timeout:      hangTimeout,
+		timeout:      timeout,
 	}
 }
 
@@ -1004,6 +1032,37 @@ func TestIsAvailable_ReportsTheActualCause(t *testing.T) {
 	})
 }
 
+// TestRunSecurityBounded_TimeoutIncludesChildStderr covers a review finding
+// on #68: a security invocation that raised a prompt can write a diagnostic
+// (e.g. "User interaction is not allowed") to stderr before the deadline
+// kills it, and that line is the one piece of evidence able to tell an
+// unlock prompt apart from an ACL prompt — runSecurityBounded's timeout
+// branch used to discard it in favour of errSecurityTimeout's generic
+// wrapping.
+func TestRunSecurityBounded_TimeoutIncludesChildStderr(t *testing.T) {
+	// Deliberately not t.Parallel(): this test's correctness depends on
+	// /bin/sh actually starting and writing to stderr before the deadline
+	// fires, and running alongside a burst of sibling tests that fork their
+	// own stand-in processes made that race flake even at 800ms. Running
+	// alone removes the contention; the generous timeout below is the
+	// remaining margin.
+	const (
+		diagnostic = "security: SecKeychainSearchCopyNext: User interaction is not allowed."
+		// Long enough for /bin/sh's own startup plus the echo to reliably
+		// complete before the deadline fires, even under CPU contention;
+		// short enough this test stays fast.
+		timeout = 2 * time.Second
+	)
+	k := newHangingKeychainWithStderr(t, timeout, diagnostic)
+	unavailable := assertUnavailable(t, "GetPassword() against a prompt that wrote to stderr before timing out", func() error {
+		_, err := k.GetPassword("whatever")
+		return err
+	}())
+	if !strings.Contains(unavailable.Reason, diagnostic) {
+		t.Errorf("Reason = %q, want it to include the child's stderr diagnostic %q", unavailable.Reason, diagnostic)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
@@ -1136,6 +1195,494 @@ func TestRunSecurity_WaitDelayBoundsGrandchildHoldingPipe(t *testing.T) {
 		t.Fatalf("GetPassword() took %s against a grandchild holding the inherited pipe, want it bounded near securityWaitDelay (%s) (limit %s)", elapsed, securityWaitDelay, limit)
 	}
 	assertUnavailable(t, "GetPassword() against a grandchild holding the inherited pipe", err)
+}
+
+// ---------------------------------------------------------------------------
+// Interactivity and the prompt timeout (issue #67)
+// ---------------------------------------------------------------------------
+
+// newHangingKeychainWithPromptTimeout is newHangingKeychain's counterpart
+// for exercising the choice a prompting call makes between k.timeout and
+// k.promptTimeout. Both bounds are supplied explicitly and kept short here —
+// unlike NewKeychain's real wiring, where the long bound is
+// humanResponseTimeout — so that covering the choice between them never
+// sleeps anywhere near that long and never depends on whether the machine
+// running `go test` has a terminal on stderr: nothing here calls
+// NewKeychain or isInteractive at all.
+func newHangingKeychainWithPromptTimeout(t *testing.T, timeout, promptTimeout time.Duration) *Keychain {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "security")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 300\n"), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return &Keychain{
+		keychainPath:  filepath.Join(dir, "irrelevant.keychain-db"),
+		security:      binary,
+		timeout:       timeout,
+		promptTimeout: promptTimeout,
+	}
+}
+
+// assertPromptTimeout is assertUnavailable's stricter sibling for the
+// hanging-stand-in tests in this section: it also asserts the failure is
+// actually a timeout, not merely *ErrUnavailable. assertUnavailable's type
+// check alone is satisfied by a transient child-spawn failure too — a
+// fork/exec race or ETXTBSY on the just-written stand-in script returns in
+// milliseconds and is also *ErrUnavailable — which made
+// TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout fail on its
+// elapsed-time assertion alone roughly once per four full -race runs
+// (review round 1 on #68), a mystery red build rather than a message
+// naming the actual mismatch.
+func assertPromptTimeout(t *testing.T, what string, err error) *ErrUnavailable {
+	t.Helper()
+	unavailable := assertUnavailable(t, what, err)
+	if !strings.Contains(unavailable.Reason, errSecurityTimeout.Error()) {
+		t.Errorf("%s: Reason = %q, want it to report a timeout (contains %q); a fast failure for another reason (e.g. a transient spawn error) passes the *ErrUnavailable type check but should fail this",
+			what, unavailable.Reason, errSecurityTimeout.Error())
+	}
+	return unavailable
+}
+
+// TestNewKeychain_PromptTimeout pins newKeychain's wiring of promptTimeout
+// to its injected interactive func's answer. It calls newKeychain directly
+// with a fixed func literal rather than NewKeychain with isInteractive
+// swapped out from under it: isInteractive is a plain func precisely so
+// this test needs no package-level mutable state, and can therefore run in
+// parallel like every other test in this file (see isInteractive's doc
+// comment in keychain.go, and securityBinary's just above it, for why that
+// matters here).
+func TestNewKeychain_PromptTimeout(t *testing.T) {
+	t.Parallel()
+
+	if k := newKeychain(func() bool { return true }); k.promptTimeout != humanResponseTimeout {
+		t.Errorf("newKeychain(always-interactive).promptTimeout = %s, want humanResponseTimeout (%s)",
+			k.promptTimeout, humanResponseTimeout)
+	}
+	if k := newKeychain(func() bool { return false }); k.promptTimeout != 0 {
+		t.Errorf("newKeychain(never-interactive).promptTimeout = %s, want 0 (same as k.timeout)", k.promptTimeout)
+	}
+}
+
+// TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout proves every
+// Backend method that can reach a prompting security subcommand is actually
+// bounded by k.promptTimeout when it is set, not merely that the code
+// compiles: k.timeout is set far shorter than the prompt bound, so a call
+// that returned near k.timeout instead would fail the lower-bound
+// assertion below.
+//
+// This covers all five Backend methods that make at least one prompting
+// call (GetPassword and GetUsername share findPassword; Add, Delete and
+// List each make their own), independently, rather than GetPassword alone:
+// review round 1 on #68 found this suite's real gap was structural, not a
+// missing assertion — nothing joined NewKeychain's/promptTimeout's
+// decision to a call that observes it for four of the six fixed call
+// sites, so reverting add-generic-password, delete-generic-password,
+// delete-internet-password and dump-keychain from a prompting bound back
+// to the machine one passed the whole suite green. A per-method entry here
+// closes that gap call site by call site.
+func TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 50 * time.Millisecond
+		promptBound  = 300 * time.Millisecond
+		// Generous relative to promptBound and independent of it, rather
+		// than a small multiplier: review round 1 flagged upper bounds at
+		// or below securityWaitDelay (1s) as liable to fail outright on any
+		// run where WaitDelay's pipe-close wait engages at all, even though
+		// this stand-in's "exec sleep 300" shape (direct child replaced, no
+		// grandchild) means it normally does not.
+		limit = promptBound + 5*securityWaitDelay
+	)
+	tests := []struct {
+		name string
+		call func(k *Keychain) error
+	}{
+		{"GetPassword", func(k *Keychain) error { _, err := k.GetPassword("x"); return err }},
+		{"GetUsername", func(k *Keychain) error { _, err := k.GetUsername("x"); return err }},
+		{"Add", func(k *Keychain) error { return k.Add("x", "acct", "pw") }},
+		{"Delete", func(k *Keychain) error { return k.Delete("x") }},
+		{"List", func(k *Keychain) error { _, err := k.List(); return err }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			k := newHangingKeychainWithPromptTimeout(t, shortTimeout, promptBound)
+
+			start := time.Now()
+			err := tt.call(k)
+			elapsed := time.Since(start)
+
+			if elapsed < promptBound {
+				t.Errorf("%s: returned after %s, want at least promptBound (%s): this call must be bounded by k.promptTimeout, not k.timeout (%s)",
+					tt.name, elapsed, promptBound, shortTimeout)
+			}
+			if elapsed > limit {
+				t.Fatalf("%s: took %s against a hanging security binary, want it bounded near promptBound (%s) (limit %s)", tt.name, elapsed, promptBound, limit)
+			}
+			assertPromptTimeout(t, tt.name+"() against a hanging security binary with promptTimeout set", err)
+		})
+	}
+}
+
+// TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout proves the
+// documented meaning of promptTimeout == 0: identical to k.timeout, which is
+// what every pre-#67 &Keychain{...} test literal in this file (none of
+// which set promptTimeout) has always gotten and must keep getting.
+//
+// The lower bound is the assertion that actually pins this: deleting the
+// fallback in runSecurityPrompt/promptOperationContext, so promptTimeout==0
+// is passed literally to context.WithTimeout as an already-dead context,
+// returns in microseconds and previously passed this test outright — the
+// suite only went red through unrelated pre-existing literals that happen
+// to break with a 0s bound, an accident that would evaporate the moment any
+// of them gained a promptTimeout (review round 1 on #68).
+func TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout(t *testing.T) {
+	t.Parallel()
+	const shortTimeout = 100 * time.Millisecond
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, 0)
+
+	start := time.Now()
+	_, err := k.GetPassword("irrelevant")
+	elapsed := time.Since(start)
+
+	if elapsed < shortTimeout {
+		t.Errorf("GetPassword() returned after %s with promptTimeout=0, want at least k.timeout (%s): promptTimeout=0 must fall back to k.timeout, not to an already-dead zero-duration context.WithTimeout",
+			elapsed, shortTimeout)
+	}
+	if limit := shortTimeout + 5*securityWaitDelay; elapsed > limit {
+		t.Fatalf("GetPassword() took %s with promptTimeout=0, want it bounded near k.timeout (%s) (limit %s)", elapsed, shortTimeout, limit)
+	}
+	unavailable := assertPromptTimeout(t, "GetPassword() against a hanging security binary with promptTimeout=0", err)
+	if !strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want the non-interactive hint since promptTimeout=0 means this call was not given a prompt bound", unavailable.Reason)
+	}
+}
+
+// TestAddAndList_TimeoutGetsSameDiagnosticAsReadDelete proves Add and List
+// route a security timeout through the same message construction
+// classifySecurityError gives GetPassword/GetUsername/Delete
+// (securityErrorReason, ultimately keychainPromptTimeoutReason), rather
+// than building their own bare "%v" wrapping. Before review round 1 on #68,
+// Add and List called runSecurityPrompt and then constructed their
+// *ErrUnavailable inline, bypassing classifySecurityError entirely — so a
+// script running `secret set`/`secret list` behind a timed-out dialog got
+// neither the lock-vs-ACL disambiguation nor the interactivity hint,
+// silently reintroducing #67's complaint on the write/list path after it
+// was fixed on read/delete.
+func TestAddAndList_TimeoutGetsSameDiagnosticAsReadDelete(t *testing.T) {
+	t.Parallel()
+	const shortTimeout = 50 * time.Millisecond
+	// promptTimeout=0 (non-interactive) so the hint is expected, giving this
+	// test a positive string to assert on rather than only the absence of a
+	// crash.
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, 0)
+
+	addErr := k.Add("x", "acct", "pw")
+	addUnavailable := assertPromptTimeout(t, "Add() against a hanging security binary", addErr)
+	if !strings.Contains(addUnavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Add() Reason = %q, want the same interactivity hint classifySecurityError gives read/delete", addUnavailable.Reason)
+	}
+
+	_, listErr := k.List()
+	listUnavailable := assertPromptTimeout(t, "List() against a hanging security binary", listErr)
+	if !strings.Contains(listUnavailable.Reason, "not detected as a terminal") {
+		t.Errorf("List() Reason = %q, want the same interactivity hint classifySecurityError gives read/delete", listUnavailable.Reason)
+	}
+}
+
+// TestIsAvailable_IgnoresPromptTimeout proves show-keychain-info stays on
+// the machine bound (k.timeout) regardless of k.promptTimeout: it is the
+// call IsAvailable makes from PersistentPreRunE ahead of every subcommand,
+// and per runSecurity's doc comment it cannot itself raise a dialog, so it
+// must keep failing fast even when this Keychain would give a prompting
+// call much longer.
+func TestIsAvailable_IgnoresPromptTimeout(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 50 * time.Millisecond
+		longPrompt   = 2 * time.Second
+	)
+	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, longPrompt)
+
+	start := time.Now()
+	err := k.IsAvailable()
+	elapsed := time.Since(start)
+
+	if limit := shortTimeout + 5*securityWaitDelay; elapsed > limit {
+		t.Fatalf("IsAvailable() took %s, want it bounded near k.timeout (%s) regardless of k.promptTimeout (%s) (limit %s)",
+			elapsed, shortTimeout, longPrompt, limit)
+	}
+	unavailable := assertPromptTimeout(t, "IsAvailable() against a hanging security binary with promptTimeout set", err)
+	if strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want no interactivity hint: show-keychain-info cannot raise a prompt, so the hint would explain nothing", unavailable.Reason)
+	}
+}
+
+// TestKeychainPromptTimeoutReason_InteractiveOmitsTerminalHint proves the
+// converse of TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout's
+// message assertion: when a prompting call had promptTimeout set (i.e. this
+// process did find a terminal on stderr) and still timed out, the message
+// says nothing about a missing terminal, because there was not one to
+// report missing — humanResponseTimeout already gave a person, if one was
+// there, every reasonable chance to answer.
+func TestKeychainPromptTimeoutReason_InteractiveOmitsTerminalHint(t *testing.T) {
+	t.Parallel()
+	const promptBound = 100 * time.Millisecond
+	k := newHangingKeychainWithPromptTimeout(t, promptBound, promptBound)
+
+	_, err := k.GetPassword("irrelevant")
+	unavailable := assertPromptTimeout(t, "GetPassword() against a hanging security binary with promptTimeout set", err)
+	if strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want no non-interactive hint: promptTimeout was set, so a terminal was in fact detected", unavailable.Reason)
+	}
+}
+
+// newDelayedMissThenHangingKeychain returns a *Keychain whose security
+// stand-in answers firstSubcommand with a definitive "not found" (exit
+// secItemNotFoundExitCode) after missDelay, and hangs forever (sleep 300)
+// on any other subcommand.
+//
+// It exists because newHangingKeychainWithPromptTimeout cannot exercise
+// promptOperationContext's actual point: findPassword and Delete only try
+// their second subcommand after a *definitive* miss on the first (see each
+// method's own comment on why), so a stand-in that hangs on the first call
+// too never reaches the second one at all — the shared-vs-fresh-deadline
+// distinction is simply never exercised, and TestFindPassword_ and
+// TestDelete_SharesOneDeadlineAcrossBothCalls would pass identically
+// whether or not the deadline is actually shared. Only a first call that
+// completes — after a delay long enough to matter, but as a genuine miss
+// rather than a timeout — lets the second call's wait be observed at all,
+// and lets a shared deadline (which gives the second call only what the
+// first one left behind) be told apart from two independent ones (which
+// gives it a full fresh window on top of missDelay).
+func newDelayedMissThenHangingKeychain(t *testing.T, timeout, promptTimeout, missDelay time.Duration, firstSubcommand string) *Keychain {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "security")
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\n\t%s) sleep %.3f; exit %d ;;\n\t*) exec sleep 300 ;;\nesac\n",
+		firstSubcommand, missDelay.Seconds(), secItemNotFoundExitCode)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return &Keychain{
+		keychainPath:  filepath.Join(dir, "irrelevant.keychain-db"),
+		security:      binary,
+		timeout:       timeout,
+		promptTimeout: promptTimeout,
+	}
+}
+
+// sharedDeadlineJitterAllowance is the margin the two
+// TestXxx_SharesOneDeadlineAcrossBothCalls tests give the *first* stand-in
+// invocation for one-time process-startup cost, on top of its own
+// deliberate sleep. Measured by hand against this file's stand-in shape: a
+// freshly t.TempDir()-written script's first exec can cost several hundred
+// milliseconds more than its steady-state cost on a loaded or sandboxed
+// host (observed up to ~300ms for a 200ms sleep on first invocation, ~0ms
+// of overhead on every invocation after) — plausibly code-signing or
+// Gatekeeper verification on a just-written executable rather than
+// anything about exec itself, since it did not reproduce on a script
+// invoked a second time. That jitter lands on whichever scenario is
+// actually being exercised (the fixed, shared-deadline one, in a passing
+// run) without changing the *difference* between the shared and
+// independent-deadline totals — missDelay does — so widening this constant
+// costs only wall-clock margin, never the test's ability to tell the two
+// apart, as long as missDelay stays comfortably larger than it.
+const sharedDeadlineJitterAllowance = 1000 * time.Millisecond
+
+// TestFindPassword_SharesOneDeadlineAcrossBothCalls proves
+// promptOperationContext's actual point for findPassword: the
+// generic-then-internet attempts share one deadline instead of each
+// getting their own. A shared deadline totals ~promptBound (missDelay on
+// the genuine miss, whatever is left of promptBound for the hanging
+// internet attempt before the shared deadline fires); two independent
+// deadlines would total ~missDelay+promptBound (a full fresh window for
+// the second call on top of the first). missDelay is chosen large relative
+// to sharedDeadlineJitterAllowance so the two stay clearly separated even
+// with that much one-time startup jitter added to whichever is observed.
+func TestFindPassword_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 20 * time.Millisecond
+		missDelay    = 3000 * time.Millisecond
+		promptBound  = 5000 * time.Millisecond
+	)
+	k := newDelayedMissThenHangingKeychain(t, shortTimeout, promptBound, missDelay, "find-generic-password")
+
+	start := time.Now()
+	_, err := k.GetPassword("irrelevant")
+	elapsed := time.Since(start)
+
+	if upper := promptBound + sharedDeadlineJitterAllowance; elapsed > upper {
+		t.Errorf("GetPassword() took %s, want it bounded near promptBound (%s, limit %s): the generic and internet attempts must share one deadline, not each get their own (independent deadlines would total ~%s)",
+			elapsed, promptBound, upper, missDelay+promptBound)
+	}
+	assertPromptTimeout(t, "GetPassword() against a delayed-miss-then-hanging security binary", err)
+}
+
+// TestDelete_SharesOneDeadlineAcrossBothCalls is
+// TestFindPassword_SharesOneDeadlineAcrossBothCalls's counterpart for
+// Delete, which shares its own promptOperationContext deadline across
+// delete-generic-password and delete-internet-password. It is not
+// redundant with the findPassword test: Delete calls
+// runSecurityBoundedCtx directly rather than through findPassword, so a
+// regression here (e.g. Delete's second call reintroducing a fresh
+// runSecurityPrompt-style deadline) would not be caught by the findPassword
+// test alone.
+func TestDelete_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
+	t.Parallel()
+	const (
+		shortTimeout = 20 * time.Millisecond
+		missDelay    = 3000 * time.Millisecond
+		promptBound  = 5000 * time.Millisecond
+	)
+	k := newDelayedMissThenHangingKeychain(t, shortTimeout, promptBound, missDelay, "delete-generic-password")
+
+	start := time.Now()
+	err := k.Delete("irrelevant")
+	elapsed := time.Since(start)
+
+	if upper := promptBound + sharedDeadlineJitterAllowance; elapsed > upper {
+		t.Errorf("Delete() took %s, want it bounded near promptBound (%s, limit %s): the generic and internet attempts must share one deadline, not each get their own (independent deadlines would total ~%s)",
+			elapsed, promptBound, upper, missDelay+promptBound)
+	}
+	assertPromptTimeout(t, "Delete() against a delayed-miss-then-hanging security binary", err)
+}
+
+// openTestPTY opens a fresh macOS pseudo-terminal pair via /dev/ptmx and the
+// TIOCPTY* ioctls — the same mechanism github.com/creack/pty uses on
+// darwin, reimplemented here without adding it as a dependency (it is not a
+// direct dependency of this module, and this repo takes no new ones for one
+// test). It exists so TestIsTerminal_PTYIsATerminal can prove isTerminal
+// answers true for an actual terminal device, not only false for
+// /dev/null (TestIsTerminal_DevNullIsNotATerminal): a mutation that
+// hard-wires isTerminal, or isInteractive above it, to return false makes
+// every other test in this file pass, because none of the rest runs with a
+// real terminal on the fd being probed (review round 1 on #68).
+//
+// Returns the slave end open for read/write; t.Cleanup handles closing both
+// ends. Skips, rather than fails, if /dev/ptmx cannot be opened or granted:
+// a sandboxed environment has been seen to deny pty allocation outright,
+// which is an environment limitation, not a regression in the code under
+// test.
+func openTestPTY(t *testing.T) *os.File {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("open /dev/ptmx: %v", err)
+	}
+	t.Cleanup(func() { _ = master.Close() })
+
+	if err := ptyIoctl(master.Fd(), unix.TIOCPTYGRANT, 0); err != nil {
+		t.Skipf("ioctl TIOCPTYGRANT: %v", err)
+	}
+	if err := ptyIoctl(master.Fd(), unix.TIOCPTYUNLK, 0); err != nil {
+		t.Skipf("ioctl TIOCPTYUNLK: %v", err)
+	}
+
+	// TIOCPTYGNAME's encoded parameter length (bits 16-28 of the ioctl
+	// request number, per the _IOC_PARM_LEN convention BSD-derived ioctls
+	// use) is 128 bytes; taken from github.com/creack/pty's darwin
+	// implementation, which this helper otherwise mirrors, rather than
+	// derived from Apple documentation (there is none for this ioctl).
+	const ptyGNameLen = 128
+	name := make([]byte, ptyGNameLen)
+	if err := ptyIoctl(master.Fd(), unix.TIOCPTYGNAME, uintptr(unsafe.Pointer(&name[0]))); err != nil {
+		t.Skipf("ioctl TIOCPTYGNAME: %v", err)
+	}
+	nul := bytes.IndexByte(name, 0)
+	if nul < 0 {
+		t.Fatalf("TIOCPTYGNAME response not NUL-terminated: %q", name)
+	}
+
+	slave, err := os.OpenFile(string(name[:nul]), os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("open pty slave %s: %v", name[:nul], err)
+	}
+	t.Cleanup(func() { _ = slave.Close() })
+	return slave
+}
+
+// ptyIoctl issues a raw ioctl via the syscall golang.org/x/sys/unix already
+// exposes generic access to (unix.Syscall/unix.SYS_IOCTL), for the three
+// TIOCPTY* requests openTestPTY needs: none of them fit the fixed
+// int/Termios/Winsize shapes unix.IoctlSet*/IoctlGet* already wrap.
+func ptyIoctl(fd uintptr, req uint, arg uintptr) error {
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(req), arg)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// TestIsTerminal_DevNullIsNotATerminal is the mutant this test exists to
+// kill named directly: an os.Stat/ModeCharDevice check would call this
+// interactive, because /dev/null is a character device — exactly the
+// mistake isTerminal's doc comment says IoctlGetTermios avoids.
+func TestIsTerminal_DevNullIsNotATerminal(t *testing.T) {
+	t.Parallel()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer f.Close()
+	if isTerminal(f.Fd()) {
+		t.Error("isTerminal(/dev/null) = true, want false")
+	}
+}
+
+// TestIsTerminal_PTYIsATerminal is TestIsTerminal_DevNullIsNotATerminal's
+// positive counterpart: without it, isTerminal hard-wired to unconditionally
+// return false passes every other test in this file, because none of them
+// runs with a real terminal on the fd being probed.
+func TestIsTerminal_PTYIsATerminal(t *testing.T) {
+	t.Parallel()
+	slave := openTestPTY(t)
+	if !isTerminal(slave.Fd()) {
+		t.Error("isTerminal(pty slave) = false, want true: a pty slave is an actual terminal device")
+	}
+}
+
+// TestIsInteractive_ReflectsStderr proves isInteractive is actually wired to
+// probe os.Stderr, not merely that isTerminal (which the two tests above
+// pin) is correct in isolation. Without this, isInteractive's one-line body
+// could be mutated to ignore isTerminal entirely — hard-wired to
+// unconditionally return false, silently disabling all of #67 — and
+// nothing in this file would notice: no other test here calls isInteractive
+// itself, precisely because newKeychain takes the interactivity decision as
+// an injected parameter so that everything else can avoid touching the
+// process's real stderr (see TestNewKeychain_PromptTimeout).
+//
+// This is the one test in the package that deliberately does touch it, by
+// reassigning os.Stderr to a pty slave (open, interactive) and then to
+// /dev/null (open, non-interactive) in turn, restoring it immediately after
+// via defer. It is deliberately not t.Parallel(): reassigning a
+// process-global var that other code may write diagnostics through is not
+// something to do while a sibling test could be running too — the same
+// reasoning TestRunSecurityBounded_TimeoutIncludesChildStderr's own
+// non-parallel comment gives for a different shared resource. Go's testing
+// package guarantees paused (t.Parallel()) tests do not execute while a
+// serial test's body is running, so this does not race with them.
+func TestIsInteractive_ReflectsStderr(t *testing.T) {
+	original := os.Stderr
+	defer func() { os.Stderr = original }()
+
+	slave := openTestPTY(t)
+	os.Stderr = slave
+	if !isInteractive() {
+		t.Error("isInteractive() = false with os.Stderr pointed at a pty, want true")
+	}
+
+	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer null.Close()
+	os.Stderr = null
+	if isInteractive() {
+		t.Error("isInteractive() = true with os.Stderr pointed at /dev/null, want false")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1836,15 @@ func lockScratchKeychain(t *testing.T, path string) {
 // to securityWaitDelay for the inherited pipes to close, so the worst case a
 // caller can observe is the sum. Checking them individually would let the pair
 // drift back over the cap while each half still looked compliant.
+//
+// Keychain.promptTimeout is deliberately not checked here, mirroring how
+// TestDbusCallTimeoutRespectsCap (libsecret_test.go) exempts
+// promptWaitTimeout: when set, promptTimeout holds humanResponseTimeout,
+// which bounds a wait on a person rather than on the security process, and
+// timeouts.go excludes exactly that from maxExternalCallTimeout. Asserting
+// it here would encode the opposite rule; see
+// TestHumanResponseTimeoutExceedsExternalCallTimeout (timeouts_test.go) for
+// the check that does apply to it.
 func TestSecurityBoundsRespectCap(t *testing.T) {
 	t.Parallel()
 	if worst := securityCommandTimeout + securityWaitDelay; worst > maxExternalCallTimeout {
