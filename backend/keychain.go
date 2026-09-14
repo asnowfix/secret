@@ -558,10 +558,22 @@ func (k *Keychain) runSecurityBounded(timeout time.Duration, args ...string) (st
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		msg := redactPasswords(strings.TrimSpace(stderr.String()))
 		if ctx.Err() != nil {
+			// The child may have written a diagnostic before the deadline
+			// killed it (e.g. "User interaction is not allowed" when no
+			// agent can answer a prompt) — that is the one piece of
+			// evidence that could tell an unlock prompt apart from an ACL
+			// prompt, so surface it rather than discard it. It still cannot
+			// be trusted to always be present or complete: the child may
+			// have been killed before it wrote anything, which is why
+			// keychainTimeoutReason still hedges between causes rather than
+			// asserting one from this alone.
+			if msg != "" {
+				return "", fmt.Errorf("%w (security %s, timeout %s): %s", errSecurityTimeout, args[0], timeout, msg)
+			}
 			return "", fmt.Errorf("%w (security %s, timeout %s)", errSecurityTimeout, args[0], timeout)
 		}
-		msg := redactPasswords(strings.TrimSpace(stderr.String()))
 		exitCode := -1
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

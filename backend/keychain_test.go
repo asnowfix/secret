@@ -323,6 +323,32 @@ func newHangingKeychain(t *testing.T) *Keychain {
 	}
 }
 
+// newHangingKeychainWithStderr is newHangingKeychain, except the stand-in
+// writes msg to stderr before it hangs — standing in for a real `security`
+// invocation that printed a diagnostic (e.g. "User interaction is not
+// allowed") before the deadline killed it, the scenario runSecurityBounded's
+// timeout branch must not discard.
+//
+// timeout is deliberately a parameter rather than the package's usual
+// hangTimeout: it has to be generous enough that `/bin/sh`'s own startup
+// plus the echo reliably completes before the deadline fires, or the test
+// would flake on exactly the race it is trying to pin down rather than
+// asserting the message-building logic.
+func newHangingKeychainWithStderr(t *testing.T, timeout time.Duration, msg string) *Keychain {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "security")
+	script := fmt.Sprintf("#!/bin/sh\necho %q 1>&2\nexec sleep 300\n", msg)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in security script: %v", err)
+	}
+	return &Keychain{
+		keychainPath: filepath.Join(dir, "irrelevant.keychain-db"),
+		security:     binary,
+		timeout:      timeout,
+	}
+}
+
 // grandchildHangSeconds is how long the grandchild left behind by
 // newGrandchildHangingKeychain's stand-in sleeps for. It only needs to
 // outlast securityWaitDelay by a comfortable margin — long enough that a
@@ -1002,6 +1028,37 @@ func TestIsAvailable_ReportsTheActualCause(t *testing.T) {
 			t.Errorf("Reason = %q, want it to name the timeout rather than fall back to the generic could-not-open phrasing", unavailable.Reason)
 		}
 	})
+}
+
+// TestRunSecurityBounded_TimeoutIncludesChildStderr covers a review finding
+// on #68: a security invocation that raised a prompt can write a diagnostic
+// (e.g. "User interaction is not allowed") to stderr before the deadline
+// kills it, and that line is the one piece of evidence able to tell an
+// unlock prompt apart from an ACL prompt — runSecurityBounded's timeout
+// branch used to discard it in favour of errSecurityTimeout's generic
+// wrapping.
+func TestRunSecurityBounded_TimeoutIncludesChildStderr(t *testing.T) {
+	// Deliberately not t.Parallel(): this test's correctness depends on
+	// /bin/sh actually starting and writing to stderr before the deadline
+	// fires, and running alongside a burst of sibling tests that fork their
+	// own stand-in processes made that race flake even at 800ms. Running
+	// alone removes the contention; the generous timeout below is the
+	// remaining margin.
+	const (
+		diagnostic = "security: SecKeychainSearchCopyNext: User interaction is not allowed."
+		// Long enough for /bin/sh's own startup plus the echo to reliably
+		// complete before the deadline fires, even under CPU contention;
+		// short enough this test stays fast.
+		timeout = 2 * time.Second
+	)
+	k := newHangingKeychainWithStderr(t, timeout, diagnostic)
+	unavailable := assertUnavailable(t, "GetPassword() against a prompt that wrote to stderr before timing out", func() error {
+		_, err := k.GetPassword("whatever")
+		return err
+	}())
+	if !strings.Contains(unavailable.Reason, diagnostic) {
+		t.Errorf("Reason = %q, want it to include the child's stderr diagnostic %q", unavailable.Reason, diagnostic)
+	}
 }
 
 // ---------------------------------------------------------------------------
