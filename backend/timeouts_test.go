@@ -38,3 +38,21 @@ func TestHumanResponseTimeoutExceedsExternalCallTimeout(t *testing.T) {
 			humanResponseTimeout, externalCallTimeout)
 	}
 }
+
+// TestHumanResponseTimeoutMeetsFloor is
+// TestHumanResponseTimeoutExceedsExternalCallTimeout's other side: being
+// longer than the machine bound is necessary but not sufficient for
+// humanResponseTimeout to be useful for what it is named after. Without
+// this, a value like 6 seconds — longer than externalCallTimeout's 5, but
+// nowhere near "enough time for a person to read an unfamiliar dialog and
+// type a password" — would pass every other check in this file while
+// reintroducing #67's complaint at a different number. See
+// humanResponseTimeoutFloor's doc comment for what 30 seconds is based on
+// and why it is a judgement call rather than a measurement.
+func TestHumanResponseTimeoutMeetsFloor(t *testing.T) {
+	t.Parallel()
+	if humanResponseTimeout < humanResponseTimeoutFloor {
+		t.Errorf("humanResponseTimeout (%s) < humanResponseTimeoutFloor (%s); too short to be useful for the person it is named after",
+			humanResponseTimeout, humanResponseTimeoutFloor)
+	}
+}

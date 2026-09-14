@@ -22,25 +22,34 @@ import "time"
 // is the thing being waited on, not the wall-clock length: a machine that
 // has not answered within a small multiple of its normal response time is
 // not going to answer, whereas a human being asked to read a dialog and
-// type a password reasonably needs longer. promptWaitTimeout in
-// libsecret.go (2 minutes, for a Secret Service unlock prompt) is the one
-// deliberate wait-for-a-human in this package and is excluded on that
-// ground.
+// type a password reasonably needs longer. humanResponseTimeout below is
+// the one deliberate wait-for-a-human duration in this package, currently
+// reached two ways — libsecret.go's promptWaitTimeout (an alias for it, for
+// a Secret Service unlock prompt) and keychain.go's Keychain.promptTimeout
+// (set to it when a macOS keychain-unlock or ACL dialog is plausibly
+// answerable) — and both are excluded from this cap on that ground.
 //
-// A GUI dialog on the machine side does not make a call a wait-for-a-human:
-// an unbounded SecItemCopyMatching behind a keychain-unlock or ACL
-// authorization dialog (issue #37, #44) is a machine call that happens to
-// block on UI. Nothing has asked the user a question they can answer in the
-// non-interactive contexts this tool runs in — git credential helper, cron,
-// CI, ssh — so those calls are in scope and are made to refuse the dialog
-// rather than wait behind it (see passwords_app.go).
-//
-// It also does not apply when a GUI dialog is raised but this process can
-// tell nobody is positioned to answer it, even though a human being is in
-// principle the thing being waited on. The Keychain backend (keychain.go)
-// decides that by probing whether stderr is a terminal; humanResponseTimeout
-// below is what it and libsecret.go's promptWaitTimeout apply once they have
-// decided someone plausibly is.
+// A GUI dialog on the machine side does not by itself make a call a
+// wait-for-a-human: an unbounded SecItemCopyMatching behind a
+// keychain-unlock or ACL authorization dialog (issue #37, #44) is a machine
+// call that happens to block on UI, not a call that has asked the user a
+// question. This is unconditional for the Security framework calls in
+// passwords_app.go — a git credential helper, cron, CI, or any other
+// caller of that code path always refuses the dialog rather than waiting
+// behind it, because SecItemCopyMatching cannot tell this process anything
+// about whether a person is watching. It is conditional for the
+// /usr/bin/security calls in keychain.go: those refuse in exactly the same
+// non-interactive contexts, but wait up to humanResponseTimeout instead
+// when this process can tell someone is plausibly watching stderr. See
+// keychain.go's isInteractive and runSecurityPrompt for that decision and
+// the reasoning behind it, including the one contested case this package
+// accepts as a deliberate trade-off rather than a gap: an ssh session with
+// a tty on stderr but nobody at the console now waits the full
+// humanResponseTimeout instead of failing at the machine bound, on the same
+// asymmetry argument externalCallTimeout's floor below rests on (a bound
+// that is too long costs latency on a path that was already broken; a bound
+// that is too short costs a user their credential on a path that was
+// working).
 const maxExternalCallTimeout = 7 * time.Second
 
 // externalCallTimeout is the default bound applied to external machine
@@ -84,34 +93,58 @@ const externalCallTimeout = 5 * time.Second
 
 // humanResponseTimeout bounds a wait for a *person* to answer a prompt this
 // package cannot suppress — a Secret Service unlock/create dialog on Linux
-// (libsecret.go's promptWaitTimeout, which is this constant under its own,
-// call-site-specific name), or a macOS keychain-unlock or per-item
+// (libsecret.go's promptWaitTimeout, an alias for this constant under its
+// own, call-site-specific name), or a macOS keychain-unlock or per-item
 // access-control dialog (keychain.go's Keychain.promptTimeout). It is
 // deliberately shared rather than reinvented per backend: the two dialogs
 // are the same kind of wait — read a prompt, type a password, click Allow —
 // and there is no argument on record for why a person would need more or
 // less time to do that depending on which OS raised the dialog.
 //
-// 2 minutes is not derived from a measurement the way externalCallTimeout
-// is; there is no "normal working time" for a human to take 2x of. It is
-// long enough to read an unfamiliar dialog and type a password once, short
-// enough that a command a user forgot they left waiting does not sit
-// unkillable indefinitely. It must stay well clear of
-// maxExternalCallTimeout on both sides of that judgment: it bounds a wait on
-// a person, not a machine, so maxExternalCallTimeout's rationale does not
-// apply to it at all (TestSecurityBoundsRespectCap and
-// TestDbusCallTimeoutRespectsCap both exempt it explicitly, mirroring each
-// other), and it must still clearly exceed externalCallTimeout or it would
-// buy nothing over the machine bound it is meant to replace.
+// This duration is not derived from a measurement the way
+// externalCallTimeout is; there is no "normal working time" for a human to
+// take 2x of. It must stay well clear of maxExternalCallTimeout on both
+// sides of that judgment: it bounds a wait on a person, not a machine, so
+// maxExternalCallTimeout's rationale does not apply to it at all
+// (TestSecurityBoundsRespectCap and TestDbusCallTimeoutRespectsCap both
+// exempt it explicitly, mirroring each other), and it must still clearly
+// exceed externalCallTimeout or it would buy nothing over the machine bound
+// it is meant to replace (TestHumanResponseTimeoutExceedsExternalCallTimeout,
+// timeouts_test.go). humanResponseTimeoutFloor below pins the other
+// direction: this value must also stay long enough to actually be useful
+// for what it is meant to cover, not merely longer than the machine bound.
 //
-// This value is applied only where the caller has also decided a human is
-// plausibly there to be waited on — an interactivity check, not a blanket
-// widening of every call's bound. See keychain.go's isInteractive for that
-// decision on macOS, and its doc comment for the one contested case: an ssh
-// session with a tty attached but nobody at the console now waits the full
-// 2 minutes instead of failing in 5 seconds, which this package accepts on
-// the same asymmetry argument externalCallTimeout's floor rests on (a bound
-// that is too long costs latency on a path that was already broken; a bound
-// that is too short costs a user their credential on a path that was
-// working) rather than on any claim that the ssh case is rare.
+// Whether this value is applied unconditionally once a prompt-shaped call
+// is reached, or only when the caller has separately decided a person is
+// plausibly there to answer, is each backend's own call, not a rule this
+// constant enforces: libsecret.go's promptWaitTimeout applies it
+// unconditionally (see its doc comment for why — this package cannot tell
+// in advance whether a Secret Service prompt is coming, so there is
+// nothing to gate on), while keychain.go's Keychain.promptTimeout applies
+// it only when isInteractive() finds a terminal on stderr. See
+// keychain.go's isInteractive and runSecurityPrompt doc comments for that
+// decision and for the one contested case it accepts as a deliberate
+// trade-off rather than a gap: an ssh session with a tty on stderr but
+// nobody at the console.
 const humanResponseTimeout = 2 * time.Minute
+
+// humanResponseTimeoutFloor is the minimum this package considers "enough
+// time for a person to read an unfamiliar system dialog and type a
+// password once". It is a judgement call, not a measurement — see
+// humanResponseTimeout's own doc comment for why there is no "normal
+// working time" to derive a floor from the way externalCallTimeout's floor
+// was derived from measured working-call latency.
+//
+// 30 seconds is chosen because it comfortably covers the two components of
+// that task that can be estimated at all even without a measurement:
+// reading a short, unfamiliar dialog (on the order of 5-10s for someone who
+// has never seen it before) and locating and typing a password, by hand or
+// via a password manager, including one mistyped attempt (on the order of
+// another 10-20s). Existing without being enforced, this claim is not
+// worth much: TestHumanResponseTimeoutMeetsFloor (timeouts_test.go) is what
+// stops humanResponseTimeout drifting below it while still passing
+// TestHumanResponseTimeoutExceedsExternalCallTimeout — a value like 6
+// seconds would satisfy "longer than the 5-second machine bound" while
+// being useless for the person it is named after, which is exactly the
+// #67 complaint again at a different number.
+const humanResponseTimeoutFloor = 30 * time.Second
