@@ -125,7 +125,16 @@ func isOwnItem(attrs map[string]string) bool {
 // dbusCallTimeout below because a human, not the provider, is on the other
 // end of it. That is also why it is exempt from maxExternalCallTimeout
 // (timeouts.go): the cap bounds waits on machines, not waits on people.
-const promptWaitTimeout = 2 * time.Minute
+//
+// It is an alias for humanResponseTimeout (timeouts.go) rather than its own
+// value: this backend has no interactivity check of its own (unlike
+// keychain.go's Keychain.promptTimeout, it applies unconditionally, since a
+// Secret Service prompt is the provider's problem to raise or not — this
+// package cannot tell in advance whether one is coming), but the *duration*
+// a human should be given once a prompt is up is the same question the
+// macOS backend answers, and it should have one answer, not two invented
+// independently.
+const promptWaitTimeout = humanResponseTimeout
 
 // dbusCallTimeout bounds every other D-Bus round trip this backend makes
 // (session setup, search, unlock request, secret read/write, property
