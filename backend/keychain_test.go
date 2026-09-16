@@ -1489,7 +1489,13 @@ func newDelayedMissThenHangingKeychain(t *testing.T, timeout, promptTimeout, mis
 // independent-deadline totals — missDelay does — so widening this constant
 // costs only wall-clock margin, never the test's ability to tell the two
 // apart, as long as missDelay stays comfortably larger than it.
-const sharedDeadlineJitterAllowance = 1000 * time.Millisecond
+// Widened from 1000ms after observing GetPassword() finish at
+// 6.000933671s against this same 5s promptBound — 0.9ms over the old
+// 6000ms limit — on this machine under full-suite t.Parallel() contention
+// (many sibling tests forking their own stand-in processes at once). The
+// difference this test discriminates (missDelay, 3000ms) stays far larger
+// than either allowance, so widening this costs only margin.
+const sharedDeadlineJitterAllowance = 2000 * time.Millisecond
 
 // TestFindPassword_SharesOneDeadlineAcrossBothCalls proves
 // promptOperationContext's actual point for findPassword: the
