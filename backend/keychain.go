@@ -22,13 +22,13 @@ import (
 // package mutates global state (and tests can therefore run in parallel).
 const securityBinary = "/usr/bin/security"
 
-// securityCommandTimeout is the machine bound applied to every security CLI
-// invocation that cannot raise a dialog — currently only show-keychain-info,
-// via runSecurity/IsAvailable — and is also runSecurityPrompt's fallback for
-// a prompting call made when this process found no terminal on stderr. This
-// path is meant to be entirely non-interactive, but /usr/bin/security itself
-// does not honor that on its own: against a locked keychain it can hand off
-// to the system's interactive keychain-unlock UI, and on a headless session
+// securityCommandTimeout is runSecurity's non-interactive fallback bound:
+// what every security CLI invocation in this file gets — show-keychain-info
+// included, as of #68's review round — when this process is not interactive
+// (isInteractive() found no terminal on stderr). This path is meant to be
+// entirely non-interactive in that case, but /usr/bin/security itself does
+// not honor that on its own: against a locked keychain it can hand off to
+// the system's interactive keychain-unlock UI, and on a headless session
 // (e.g. a CI runner with no logged-in GUI user to answer that prompt) that
 // hand-off blocks forever with no output. This was confirmed to not be a
 // case of Go's exec.Cmd inheriting/blocking on stdin — cmd.Stdin is left nil
@@ -39,13 +39,12 @@ const securityBinary = "/usr/bin/security"
 //
 // The value comes from externalCallTimeout (timeouts.go), which carries the
 // measurements it was derived from and the reasoning for the floor applied
-// to them. Note the effective worst case for any one security invocation
-// bounded by this constant is this plus securityWaitDelay below; both
-// together must stay under maxExternalCallTimeout, which
-// TestSecurityBoundsRespectCap asserts. A prompting call bounded instead by
-// Keychain.promptTimeout (i.e. humanResponseTimeout, timeouts.go) is
-// deliberately exempt from that cap — see promptTimeout's doc comment and
-// TestSecurityBoundsRespectCap's.
+// to them. Note the effective worst case for a non-interactive call bounded
+// by this constant is this plus securityWaitDelay below; both together must
+// stay under maxExternalCallTimeout, which TestSecurityBoundsRespectCap
+// asserts. An interactive call, bounded instead by Keychain.promptTimeout
+// (i.e. humanResponseTimeout, timeouts.go), is deliberately exempt from that
+// cap — see promptTimeout's doc comment and TestSecurityBoundsRespectCap's.
 const securityCommandTimeout = externalCallTimeout
 
 // securityWaitDelay is how long runSecurityBoundedCtx waits, after killing a
@@ -149,27 +148,39 @@ func wasPrompting(err error) bool {
 type Keychain struct {
 	keychainPath string
 	// security is the path to the security CLI, and timeout bounds every
-	// invocation of it that cannot raise a dialog (and is the fallback for
-	// one that can, when promptTimeout is zero). They are fields rather than
-	// package vars so tests can substitute a stand-in binary and a short
-	// timeout without mutating process-wide state.
+	// invocation of it made non-interactively (and is the fallback for one
+	// made interactively, when promptTimeout is zero). They are fields
+	// rather than package vars so tests can substitute a stand-in binary
+	// and a short timeout without mutating process-wide state.
 	security string
 	timeout  time.Duration
-	// promptTimeout bounds the calls that can raise a keychain-unlock or
-	// per-item access-control dialog (everything runSecurityPrompt,
-	// findPassword and Delete are used for; see runSecurityPrompt's doc
-	// comment for the exact subcommand list), in place of timeout. Zero
-	// means "same as timeout": that keeps every existing &Keychain{...}
-	// literal in this file's tests, which do not set it, byte-for-byte
-	// identical to the pre-#67 non-interactive behaviour, and keeps
-	// newKeychain's own zero value (when the injected interactive func
-	// returns false) correct without a separate branch.
-	//
-	// newKeychain sets this to humanResponseTimeout when interactive()
-	// reports a person is plausibly watching stderr; otherwise it leaves it
-	// zero, and a prompting call falls back to timeout, exactly as a
-	// non-prompting one always has.
+	// promptTimeout bounds every security invocation this file makes (see
+	// runSecurity's doc comment) when interactive is true, in place of
+	// timeout. Zero means "same as timeout": that keeps every existing
+	// &Keychain{...} literal in this file's tests, which do not set it,
+	// byte-for-byte identical to the pre-#67 non-interactive behaviour, and
+	// keeps newKeychain's own zero value (when the injected interactive
+	// func returns false) correct without a separate branch.
 	promptTimeout time.Duration
+	// interactive records whether newKeychain's interactivity probe found a
+	// terminal on stderr — independently of promptTimeout's value, not
+	// inferred as promptTimeout != 0. runSecurity, findPassword and Delete
+	// read it (not promptTimeout) to decide what a timeout on their call
+	// should say about why.
+	//
+	// It is a separate field rather than a derived fact because "does this
+	// Keychain have a long bound configured" and "did the probe actually
+	// find a terminal" are two different questions that happened to always
+	// agree while newKeychain was the only place either was ever set. They
+	// stop agreeing the moment anything else sets promptTimeout without
+	// going through the probe — a hand-built *Keychain in a test (the
+	// opt-in live-test helper newScratchKeychain already does this,
+	// leaving both at their zero value, which happens to still be
+	// correct — but only because it sets neither) or a hypothetical future
+	// --prompt-timeout flag, which would otherwise silently borrow the "a
+	// terminal was found" meaning it never earned and suppress the
+	// non-interactive hint in exactly the case it exists to explain.
+	interactive bool
 }
 
 func NewKeychain() *Keychain {
@@ -179,10 +190,10 @@ func NewKeychain() *Keychain {
 // newKeychain is NewKeychain with the interactivity decision injected as a
 // parameter instead of read from isInteractive directly, so
 // TestNewKeychain_PromptTimeout can pin the wiring between "interactive"
-// and Keychain.promptTimeout with a fixed answer — never a real terminal,
-// never the absence of one — without touching any mutable package state.
-// securityBinary's comment above explains why that matters: it is the same
-// reason this package's test seams are struct fields and function
+// and Keychain.promptTimeout/interactive with a fixed answer — never a real
+// terminal, never the absence of one — without touching any mutable package
+// state. securityBinary's comment above explains why that matters: it is
+// the same reason this package's test seams are struct fields and function
 // parameters rather than package vars.
 func newKeychain(interactive func() bool) *Keychain {
 	home, _ := os.UserHomeDir()
@@ -192,6 +203,7 @@ func newKeychain(interactive func() bool) *Keychain {
 		timeout:      securityCommandTimeout,
 	}
 	if interactive() {
+		k.interactive = true
 		k.promptTimeout = humanResponseTimeout
 	}
 	return k
@@ -217,7 +229,7 @@ func (k *Keychain) IsAvailable() error {
 // other cause.
 func keychainUnavailableReason(path string, err error) string {
 	if errors.Is(err, errSecurityTimeout) {
-		return keychainTimeoutReason(err)
+		return keychainTimeoutReason(err, wasPrompting(err))
 	}
 	return fmt.Sprintf("could not open keychain %s: %v — if it is locked, run `security unlock-keychain %s`", path, err, path)
 }
@@ -313,8 +325,8 @@ func (k *Keychain) GetPassword(service string) (string, error) {
 	return strings.TrimRight(output, "\n"), nil
 }
 
-// classifySecurityError maps an error from runSecurity/runSecurityPrompt/
-// findPassword/Delete onto the Backend error types callers switch on,
+// classifySecurityError maps an error from runSecurity/findPassword/Delete
+// onto the Backend error types callers switch on,
 // mirroring classifyBusError (libsecret.go) and classifyCredError
 // (wincred.go). Only the definitive errItemNotFound sentinel becomes
 // *ErrNotFound; everything else — a timeout, a locked keychain, a missing
@@ -366,21 +378,49 @@ func securityErrorReason(verbPhrase string, err error) string {
 // factored out.
 const keychainTimeoutCause = "the security command did not respond in time, which can mean the keychain is locked with no agent able to answer an unlock prompt, or that a per-item access-control prompt is awaiting approval nothing can show"
 
+// withInteractivityHint appends, only when !wasInteractive, the fact that a
+// timed-out call was bounded at the machine timeout rather than given up to
+// humanResponseTimeout to wait for a person. wasInteractive is read off the
+// error that timed out (Keychain.interactive, stamped onto it by
+// runSecurityBoundedCtx at the call site — see securityTimeoutError's doc
+// comment) rather than from any *Keychain's current field state. Shared by
+// keychainTimeoutReason and keychainPromptTimeoutReason so the wording
+// cannot drift between the two.
+func withInteractivityHint(reason string, wasInteractive bool) string {
+	if wasInteractive {
+		return reason
+	}
+	return reason + fmt.Sprintf(" — stderr was not detected as a terminal, so this call was bounded at the machine timeout above rather than given up to %s to wait for a person to answer a prompt; rerun from an interactive terminal if one needs answering", humanResponseTimeout)
+}
+
 // keychainTimeoutReason builds the *ErrUnavailable diagnostic for a
 // show-keychain-info invocation that timed out (via runSecurity, from
-// IsAvailable/keychainUnavailableReason). show-keychain-info cannot itself
-// raise a dialog (see runSecurityPrompt's doc comment for the subcommands
-// that can), so unlike keychainPromptTimeoutReason below there is no
-// interactivity fact worth adding here: the bound it hit is
-// securityCommandTimeout regardless of whether stderr is a terminal, so
-// naming that would explain nothing.
+// IsAvailable/keychainUnavailableReason).
+//
+// Earlier revisions of this file claimed show-keychain-info "cannot itself
+// raise a dialog" and held IsAvailable at the always-short machine bound on
+// that strength. That claim does not survive measurement and has been
+// removed: against a locked scratch keychain on 2026-09-16,
+// show-keychain-info raised the unlock dialog and was cancelled after
+// 4.53s (exit 128, "User canceled the operation"). It is not
+// unconditionally true the other way either — the identical command
+// against the identical kind of scratch keychain returned exit 152
+// immediately, no dialog, two days earlier (2026-09-14). What actually
+// distinguishes the two runs — session state, SecurityAgent availability
+// and screen-lock state are all plausible — is not established, and
+// nothing in this file asserts it either way. What is established, and all
+// this function now relies on, is narrower: show-keychain-info can raise a
+// dialog, at least sometimes, which is enough reason to give IsAvailable
+// the same interactivity-aware bound as every other call in this file (see
+// runSecurity) rather than holding it at the machine bound on an
+// assumption that turned out not to hold.
 //
 // Its remedy does not point back at `security show-keychain-info`: that is
 // the very command that just timed out, so telling the user to run it
-// again is circular advice at this call site's only caller (IsAvailable),
-// which issue #68's review round flagged this function for still doing
-// after it was re-scoped to serve only that one caller. See
-// keychainPromptTimeoutReason for the sibling that serves every other
+// again would be circular advice at this call site's only caller
+// (IsAvailable) — the one respect in which this function still needs to
+// differ from keychainPromptTimeoutReason now that both can wait on the
+// same bound. See that function for the sibling that serves every other
 // timeout classification in this file, whose remedy correctly does point
 // at show-keychain-info — for those call sites it names a different
 // command than the one that failed.
@@ -397,20 +437,19 @@ const keychainTimeoutCause = "the security command did not respond in time, whic
 // distinguish the two, which is what keychainTimeoutCause now states once
 // for both functions instead of asserting the single cause that used to be
 // printed unconditionally.
-func keychainTimeoutReason(err error) string {
-	return fmt.Sprintf("keychain unavailable: %v — %s; open Keychain Access.app to check for a pending dialog, or retry once nothing else is contending for the keychain", err, keychainTimeoutCause)
+func keychainTimeoutReason(err error, wasInteractive bool) string {
+	reason := fmt.Sprintf("keychain unavailable: %v — %s; open Keychain Access.app to check for a pending dialog, or retry once nothing else is contending for the keychain", err, keychainTimeoutCause)
+	return withInteractivityHint(reason, wasInteractive)
 }
 
 // keychainPromptTimeoutReason builds the *ErrUnavailable diagnostic for a
-// timed-out invocation that went through runSecurityPrompt, findPassword or
-// Delete — find-generic-password, find-internet-password,
+// timed-out invocation of any of the six non-IsAvailable subcommands this
+// file uses — find-generic-password, find-internet-password,
 // add-generic-password, delete-generic-password, delete-internet-password,
-// dump-keychain: every subcommand that can hand off to a keychain-unlock or
-// per-item access-control dialog. Unlike keychainTimeoutReason, its remedy
-// does point at `security show-keychain-info`: for these call sites that
-// names a genuinely different command than the one that failed, so running
-// it is not circular advice — see keychainTimeoutReason's own doc comment
-// for the sibling call site where the same advice would be.
+// dump-keychain — all bounded via runSecurity exactly as show-keychain-info
+// now is too. keychainTimeoutReason (above) is IsAvailable's counterpart;
+// the two differ only in remedy, not in whether an interactivity hint
+// applies — both share withInteractivityHint.
 //
 // wasInteractive answers "was this particular call given up to
 // humanResponseTimeout to wait for a person", as recorded on the error that
@@ -428,10 +467,7 @@ func keychainTimeoutReason(err error) string {
 // anyway).
 func keychainPromptTimeoutReason(err error, wasInteractive bool) string {
 	reason := fmt.Sprintf("keychain unavailable: %v — %s; check `security show-keychain-info` for the lock state before assuming either", err, keychainTimeoutCause)
-	if wasInteractive {
-		return reason
-	}
-	return reason + fmt.Sprintf(" — stderr was not detected as a terminal, so this call was bounded at the machine timeout above rather than given up to %s to wait for a person to answer a prompt; rerun from an interactive terminal if one needs answering", humanResponseTimeout)
+	return withInteractivityHint(reason, wasInteractive)
 }
 
 func (k *Keychain) Add(service, account, password string) error {
@@ -439,7 +475,7 @@ func (k *Keychain) Add(service, account, password string) error {
 	// non-interactive ACL grant it creates is the entire reason this backend
 	// shells out to /usr/bin/security instead of using cgo (see AGENTS.md),
 	// so it must never follow the test seam.
-	_, err := k.runSecurityPrompt("add-generic-password",
+	_, err := k.runSecurity("add-generic-password",
 		"-s", service,
 		"-a", account,
 		"-w", password,
@@ -474,7 +510,7 @@ func (k *Keychain) Delete(service string) error {
 	// for what this does and does not bound.
 	ctx, cancel, start := k.promptOperationContext()
 	defer cancel()
-	prompting := k.promptTimeout != 0
+	prompting := k.interactive
 
 	_, err := k.runSecurityBoundedCtx(ctx, start, prompting, "delete-generic-password", "-s", service, k.keychainPath)
 	if err == nil {
@@ -503,7 +539,7 @@ func (k *Keychain) Edit() error {
 }
 
 func (k *Keychain) List() ([]string, error) {
-	out, err := k.runSecurityPrompt("dump-keychain", k.keychainPath)
+	out, err := k.runSecurity("dump-keychain", k.keychainPath)
 	if err != nil {
 		// Same reasoning as Add: no *ErrNotFound outcome to classify, but
 		// still routed through securityErrorReason for the same message
@@ -602,63 +638,79 @@ const securityLockedExitCode = 152
 // interpolated on failure, not the primary guarantee.
 var securityPasswordLine = regexp.MustCompile(`(?m)^password: .*$`)
 
-// runSecurity runs a security subcommand that cannot raise a dialog —
-// show-keychain-info is currently the only one — bounded by k.timeout, so
-// it must always fail fast regardless of interactivity: IsAvailable calls
-// it from PersistentPreRunE ahead of every subcommand. Everything that can
-// raise a keychain-unlock or ACL dialog goes through runSecurityPrompt
-// instead. See runSecurityBoundedCtx for what a call bounded either way is
-// classified into.
-func (k *Keychain) runSecurity(args ...string) (string, error) {
-	return k.runSecurityBounded(k.timeout, false, args...)
-}
-
-// runSecurityPrompt is runSecurity's counterpart for the security
-// subcommands that can hand off to a keychain-unlock or per-item
-// access-control dialog: find-generic-password, find-internet-password
-// (via findPassword, which calls runSecurityBoundedCtx directly rather than
-// through this function — see promptOperationContext), add-generic-password
-// (Add), delete-generic-password and delete-internet-password (via Delete,
-// same reason as findPassword), and dump-keychain (List).
+// runSecurity runs any single-call security subcommand this file uses —
+// show-keychain-info (IsAvailable), add-generic-password (Add) and
+// dump-keychain (List). findPassword and Delete do not call it: each makes
+// up to two calls and shares one deadline across them via
+// promptOperationContext/runSecurityBoundedCtx directly instead, which
+// this function does not support.
 //
-// It is bounded by k.promptTimeout when that is set (i.e. newKeychain
-// decided, via the injected interactive func, that someone is plausibly
-// watching stderr) and falls back to k.timeout — byte-for-byte the same
-// bound runSecurity uses — otherwise, so a non-interactive invocation (git
+// It is bounded by k.promptTimeout when k.interactive is true (i.e.
+// newKeychain decided, via the injected interactive func, that someone is
+// plausibly watching stderr) and falls back to k.timeout — the
+// non-interactive bound — otherwise, so a non-interactive invocation (git
 // credential helper, cron, CI, an ssh session with no tty on stderr) is
-// unaffected by #67 and still fails within securityCommandTimeout.
+// unaffected by #67 for any call, IsAvailable's included, and still fails
+// within securityCommandTimeout.
 //
-// The known and accepted residual case is the inverse: an ssh session that
-// does have a tty on stderr, but nobody at the console to answer a dialog
-// it raises, now waits the full k.promptTimeout instead of failing in
-// k.timeout. timeouts.go's humanResponseTimeout doc comment records the
+// Until issue #68's review round this was two differently-bounded
+// methods: runSecurity, always on the machine bound, for show-keychain-info
+// specifically — reasoned to be incapable of raising a dialog and therefore
+// safe to hold at a fail-fast bound ahead of every subcommand; and
+// runSecurityPrompt, interactivity-aware, for the other six. That split does
+// not survive measurement. Against a locked scratch keychain on 2026-09-16,
+// show-keychain-info raised the unlock dialog and was cancelled after
+// 4.53s — the same shape of prompt the other six can raise. (On 2026-09-14
+// the identical command against the identical kind of scratch keychain
+// returned exit 152 immediately, no dialog; what distinguishes the two runs
+// is not established, and nothing here asserts show-keychain-info always or
+// never prompts — only that it can, which is reason enough to put it on
+// this bound rather than a shorter one it might not need.) IsAvailable was
+// held at the machine bound specifically so it would fail fast ahead of
+// every subcommand — a real concern only for a non-interactive caller,
+// which the interactivity gate already separates from everything else:
+// a cron job, CI step or credential helper with no terminal keeps exactly
+// the old 5-second behaviour; a person at a terminal now gets time to
+// answer whichever dialog IsAvailable's own call raises, which is what #67
+// asked for at this call site specifically — as distinct from the per-item
+// ACL case on an unlocked keychain, which the rest of this file already
+// covered before this constant's fallback role was widened to include
+// show-keychain-info.
+//
+// The known and accepted residual case is the inverse of the interactivity
+// gate itself: an ssh session that does have a tty on stderr, but nobody at
+// the console to answer a dialog it raises, now waits the full
+// k.promptTimeout instead of failing in k.timeout, on every call including
+// IsAvailable's. timeouts.go's humanResponseTimeout doc comment records the
 // reasoning in full; in short, that costs latency on a path that was
 // already broken, whereas the machine bound this replaces cost a user
-// sitting right there their credential on a path that was working, and the
-// asymmetry is the same one externalCallTimeout's own floor rests on
-// (timeouts.go).
+// sitting right there their credential (or, now, their ability to run any
+// command at all, since IsAvailable gates every one of them) on a path
+// that was working, and the asymmetry is the same one externalCallTimeout's
+// own floor rests on (timeouts.go).
 //
 // What this function — and findPassword's and Delete's direct use of
 // runSecurityBoundedCtx — do not bound: composition *across* Backend
 // methods. See promptOperationContext's doc comment for what is bounded
 // within one Keychain method and what still is not.
-func (k *Keychain) runSecurityPrompt(args ...string) (string, error) {
-	timeout := k.promptTimeout
-	prompting := k.promptTimeout != 0
-	if timeout == 0 {
-		timeout = k.timeout
+func (k *Keychain) runSecurity(args ...string) (string, error) {
+	timeout := k.timeout
+	if k.interactive {
+		timeout = k.promptTimeout
 	}
-	return k.runSecurityBounded(timeout, prompting, args...)
+	return k.runSecurityBounded(timeout, k.interactive, args...)
 }
 
 // promptOperationContext returns a context bounded by the prompt-eligible
-// deadline for one Backend-interface operation, the wall-clock time it
-// started, and whether that deadline is actually the prompt bound (as
-// opposed to a fallback to k.timeout). findPassword and Delete each call
-// this once, at the top of the method, and pass the same three values to
-// each of their up-to-two security invocations — the generic-password
-// attempt and, only on a definitive miss, the internet-password fallback —
-// so the two share one window rather than each getting its own.
+// deadline for one Backend-interface operation, and the wall-clock time it
+// started. findPassword and Delete each call this once, at the top of the
+// method, and pass both values to each of their up-to-two security
+// invocations — the generic-password attempt and, only on a definitive
+// miss, the internet-password fallback — so the two share one window
+// rather than each getting its own. Callers determine separately whether
+// that window is actually the prompt bound (Keychain.interactive — see its
+// doc comment and runSecurity's for why that is a field, not something
+// re-derived from promptTimeout).
 //
 // Without this, GetPassword/GetUsername (findPassword: generic then
 // internet) and Delete (generic then internet) could each take up to
@@ -689,11 +741,11 @@ func (k *Keychain) promptOperationContext() (ctx context.Context, cancel context
 }
 
 // runSecurityBounded creates a fresh single-call context bounded by timeout
-// and delegates to runSecurityBoundedCtx. It exists for runSecurity and
-// runSecurityPrompt, whose callers (Add, List, IsAvailable) each make at
-// most one security invocation per Backend operation and so have no reason
-// to share a deadline the way findPassword and Delete do — see
-// promptOperationContext for the two-call case.
+// and delegates to runSecurityBoundedCtx. It exists for runSecurity, whose
+// callers (Add, List, IsAvailable) each make at most one security
+// invocation per Backend operation and so have no reason to share a
+// deadline the way findPassword and Delete do — see promptOperationContext
+// for the two-call case.
 func (k *Keychain) runSecurityBounded(timeout time.Duration, prompting bool, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -824,7 +876,7 @@ func (k *Keychain) findPassword(service string, passwordOnly bool) (string, erro
 	// comment for why, and for what this does and does not bound.
 	ctx, cancel, start := k.promptOperationContext()
 	defer cancel()
-	prompting := k.promptTimeout != 0
+	prompting := k.interactive
 
 	// Try generic password first. A real failure here (not a "not found")
 	// means we cannot determine whether the item exists at all, so return

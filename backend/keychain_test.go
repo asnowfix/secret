@@ -1221,6 +1221,12 @@ func newHangingKeychainWithPromptTimeout(t *testing.T, timeout, promptTimeout ti
 		security:      binary,
 		timeout:       timeout,
 		promptTimeout: promptTimeout,
+		// interactive tracks promptTimeout here deliberately: this helper's
+		// whole point is to simulate what newKeychain would have produced
+		// for a given interactivity answer, and newKeychain always sets the
+		// two together (see Keychain.interactive's doc comment for why
+		// production code must not infer one from the other in general).
+		interactive: promptTimeout != 0,
 	}
 }
 
@@ -1271,16 +1277,30 @@ func TestNewKeychain_PromptTimeout(t *testing.T) {
 // that returned near k.timeout instead would fail the lower-bound
 // assertion below.
 //
-// This covers all five Backend methods that make at least one prompting
-// call (GetPassword and GetUsername share findPassword; Add, Delete and
-// List each make their own), independently, rather than GetPassword alone:
-// review round 1 on #68 found this suite's real gap was structural, not a
-// missing assertion — nothing joined NewKeychain's/promptTimeout's
-// decision to a call that observes it for four of the six fixed call
-// sites, so reverting add-generic-password, delete-generic-password,
-// delete-internet-password and dump-keychain from a prompting bound back
-// to the machine one passed the whole suite green. A per-method entry here
-// closes that gap call site by call site.
+// This covers six Backend methods (GetPassword and GetUsername share
+// findPassword; Add, Delete, List and IsAvailable each make their own),
+// independently, rather than GetPassword alone: review round 1 on #68
+// found this suite's real gap was structural, not a missing assertion —
+// nothing joined NewKeychain's/promptTimeout's decision to a call that
+// observes it for four of the six then-fixed call sites, so reverting
+// add-generic-password, delete-generic-password, delete-internet-password
+// and dump-keychain from a prompting bound back to the machine one passed
+// the whole suite green. A per-method entry here closes that gap for
+// add-generic-password, delete-generic-password and dump-keychain.
+//
+// It does NOT close it for find-internet-password or delete-internet-password.
+// The stand-in this test uses (newHangingKeychainWithPromptTimeout) hangs
+// on every subcommand unconditionally, so GetPassword/GetUsername's Delete's
+// first call (find-generic-password, delete-generic-password) always times
+// out rather than returning a definitive miss — and only a definitive miss
+// makes findPassword/Delete try their second subcommand at all (see each
+// method's own comment on why). This test's Delete and GetPassword/
+// GetUsername entries therefore only ever exercise the generic-password
+// leg; review round 2 confirmed reverting the internet-password leg
+// specifically leaves this test, and the rest of the suite, green.
+// TestFindPassword_SharesOneDeadlineAcrossBothCalls and
+// TestDelete_SharesOneDeadlineAcrossBothCalls close that gap instead, with
+// a stand-in built to actually reach the second call.
 func TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout(t *testing.T) {
 	t.Parallel()
 	const (
@@ -1303,6 +1323,7 @@ func TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout(t *testing.T) {
 		{"Add", func(k *Keychain) error { return k.Add("x", "acct", "pw") }},
 		{"Delete", func(k *Keychain) error { return k.Delete("x") }},
 		{"List", func(k *Keychain) error { _, err := k.List(); return err }},
+		{"IsAvailable", func(k *Keychain) error { return k.IsAvailable() }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1331,7 +1352,7 @@ func TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout(t *testing.T) {
 // which set promptTimeout) has always gotten and must keep getting.
 //
 // The lower bound is the assertion that actually pins this: deleting the
-// fallback in runSecurityPrompt/promptOperationContext, so promptTimeout==0
+// fallback in runSecurity/promptOperationContext, so promptTimeout==0
 // is passed literally to context.WithTimeout as an already-dead context,
 // returns in microseconds and previously passed this test outright — the
 // suite only went red through unrelated pre-existing literals that happen
@@ -1391,31 +1412,43 @@ func TestAddAndList_TimeoutGetsSameDiagnosticAsReadDelete(t *testing.T) {
 	}
 }
 
-// TestIsAvailable_IgnoresPromptTimeout proves show-keychain-info stays on
-// the machine bound (k.timeout) regardless of k.promptTimeout: it is the
-// call IsAvailable makes from PersistentPreRunE ahead of every subcommand,
-// and per runSecurity's doc comment it cannot itself raise a dialog, so it
-// must keep failing fast even when this Keychain would give a prompting
-// call much longer.
-func TestIsAvailable_IgnoresPromptTimeout(t *testing.T) {
+// TestIsAvailable_UsesTimeoutWhenNotInteractive proves show-keychain-info
+// stays on the machine bound (k.timeout) when this Keychain is not
+// interactive, regardless of any k.promptTimeout value that happens to be
+// set on it — mirroring TestRunSecurityPrompt_ZeroPromptTimeoutFallsBackToTimeout's
+// non-interactive case for the other methods.
+//
+// This used to be TestIsAvailable_IgnoresPromptTimeout, asserting
+// show-keychain-info ignores k.promptTimeout unconditionally. That claim
+// does not survive measurement (see runSecurity's doc comment: on
+// 2026-09-16, show-keychain-info raised a real unlock dialog against a
+// locked scratch keychain), and the fix built on it — IsAvailable now takes
+// the same interactivity-aware bound as every other call in this file. What
+// survives is narrower: a *non-interactive* IsAvailable still stays on the
+// machine bound, which is what this test now actually pins, using a
+// Keychain built with promptTimeout set but interactive deliberately left
+// false — the decoupled case Keychain.interactive's doc comment exists to
+// make representable.
+func TestIsAvailable_UsesTimeoutWhenNotInteractive(t *testing.T) {
 	t.Parallel()
 	const (
 		shortTimeout = 50 * time.Millisecond
 		longPrompt   = 2 * time.Second
 	)
 	k := newHangingKeychainWithPromptTimeout(t, shortTimeout, longPrompt)
+	k.interactive = false // decoupled from promptTimeout, deliberately
 
 	start := time.Now()
 	err := k.IsAvailable()
 	elapsed := time.Since(start)
 
 	if limit := shortTimeout + 5*securityWaitDelay; elapsed > limit {
-		t.Fatalf("IsAvailable() took %s, want it bounded near k.timeout (%s) regardless of k.promptTimeout (%s) (limit %s)",
+		t.Fatalf("IsAvailable() took %s, want it bounded near k.timeout (%s) when not interactive, regardless of k.promptTimeout (%s) (limit %s)",
 			elapsed, shortTimeout, longPrompt, limit)
 	}
-	unavailable := assertPromptTimeout(t, "IsAvailable() against a hanging security binary with promptTimeout set", err)
-	if strings.Contains(unavailable.Reason, "not detected as a terminal") {
-		t.Errorf("Reason = %q, want no interactivity hint: show-keychain-info cannot raise a prompt, so the hint would explain nothing", unavailable.Reason)
+	unavailable := assertPromptTimeout(t, "IsAvailable() against a hanging security binary, not interactive", err)
+	if !strings.Contains(unavailable.Reason, "not detected as a terminal") {
+		t.Errorf("Reason = %q, want the non-interactive hint since this call was not given a prompt bound", unavailable.Reason)
 	}
 }
 
@@ -1456,6 +1489,18 @@ func TestKeychainPromptTimeoutReason_InteractiveOmitsTerminalHint(t *testing.T) 
 // and lets a shared deadline (which gives the second call only what the
 // first one left behind) be told apart from two independent ones (which
 // gives it a full fresh window on top of missDelay).
+//
+// The first exec of a freshly t.TempDir()-written binary — this function's
+// binary, every time it is called, since t.TempDir() is unique per call —
+// measured on this environment at up to ~400ms of one-time overhead on top
+// of the process's own work (a bare `exit 44` with no sleep at all still
+// cost ~280-310ms; a same-path re-exec afterward cost ~10ms), plausibly
+// code-signing or Gatekeeper verification rather than anything about exec
+// itself. It lands once, on whichever subcommand actually runs first
+// (firstSubcommand), not on the second invocation of this same binary
+// file. Callers sizing missDelay/promptBound against
+// sharedDeadlineMargin need to budget for it on that call alone, not
+// double it.
 func newDelayedMissThenHangingKeychain(t *testing.T, timeout, promptTimeout, missDelay time.Duration, firstSubcommand string) *Keychain {
 	t.Helper()
 	dir := t.TempDir()
@@ -1470,49 +1515,96 @@ func newDelayedMissThenHangingKeychain(t *testing.T, timeout, promptTimeout, mis
 		security:      binary,
 		timeout:       timeout,
 		promptTimeout: promptTimeout,
+		// See newHangingKeychainWithPromptTimeout's identical field for why
+		// this tracks promptTimeout here.
+		interactive: promptTimeout != 0,
 	}
 }
 
-// sharedDeadlineJitterAllowance is the margin the two
-// TestXxx_SharesOneDeadlineAcrossBothCalls tests give the *first* stand-in
-// invocation for one-time process-startup cost, on top of its own
-// deliberate sleep. Measured by hand against this file's stand-in shape: a
-// freshly t.TempDir()-written script's first exec can cost several hundred
-// milliseconds more than its steady-state cost on a loaded or sandboxed
-// host (observed up to ~300ms for a 200ms sleep on first invocation, ~0ms
-// of overhead on every invocation after) — plausibly code-signing or
-// Gatekeeper verification on a just-written executable rather than
-// anything about exec itself, since it did not reproduce on a script
-// invoked a second time. That jitter lands on whichever scenario is
-// actually being exercised (the fixed, shared-deadline one, in a passing
-// run) without changing the *difference* between the shared and
-// independent-deadline totals — missDelay does — so widening this constant
-// costs only wall-clock margin, never the test's ability to tell the two
-// apart, as long as missDelay stays comfortably larger than it.
-// Widened from 1000ms after observing GetPassword() finish at
-// 6.000933671s against this same 5s promptBound — 0.9ms over the old
-// 6000ms limit — on this machine under full-suite t.Parallel() contention
-// (many sibling tests forking their own stand-in processes at once). The
-// difference this test discriminates (missDelay, 3000ms) stays far larger
-// than either allowance, so widening this costs only margin.
-const sharedDeadlineJitterAllowance = 2000 * time.Millisecond
+// sharedDeadlineMarginPercent is the two TestXxx_SharesOneDeadlineAcrossBothCalls
+// tests' tolerance around promptBound, expressed as a fraction of the
+// window rather than a fixed absolute duration.
+//
+// This constant replaces sharedDeadlineJitterAllowance (a fixed 1000ms,
+// briefly widened to 2000ms by a follow-up commit this one supersedes,
+// after a single observed miss at 6.000933671s against a 5s promptBound —
+// 0.9ms over the then-6000ms limit — under full-suite t.Parallel()
+// contention). Widening a fixed allowance on a multi-second window was
+// fixing the symptom: review round 2 measured 3 failures in ~1800
+// sub-test executions of these two tests, all landing within a few
+// milliseconds of the ceiling, and pointed out the window itself
+// (missDelay 3000ms, promptBound 5000ms) was unnecessarily large for the
+// "was this call actually bounded by the prompt timeout" question —
+// TestRunSecurityPrompt_AllPromptingCallSitesUsePromptTimeout already
+// answers a version of it at promptBound=300ms — and was also the
+// backend package's test-suite cost driver (~9.3s on main to 11-12.5s).
+// Shrinking the window (missDelay, promptBound below) is the actual fix;
+// expressing the margin as a fraction of it, rather than a value picked to
+// fit one measurement on one machine, is what keeps that fix from being
+// silently undone the next time either constant changes: a fixed
+// millisecond figure that was barely enough at 5-6s is far too much at a
+// few hundred milliseconds, and one derived from nothing would be too
+// little at a much larger window some future change might need.
+const sharedDeadlineMarginPercent = 20
+
+// sharedDeadlineMargin returns sharedDeadlineMarginPercent of window,
+// rounded to the nearest millisecond for readable failure messages.
+func sharedDeadlineMargin(window time.Duration) time.Duration {
+	return (window * sharedDeadlineMarginPercent / 100).Round(time.Millisecond)
+}
 
 // TestFindPassword_SharesOneDeadlineAcrossBothCalls proves
 // promptOperationContext's actual point for findPassword: the
 // generic-then-internet attempts share one deadline instead of each
-// getting their own. A shared deadline totals ~promptBound (missDelay on
-// the genuine miss, whatever is left of promptBound for the hanging
-// internet attempt before the shared deadline fires); two independent
-// deadlines would total ~missDelay+promptBound (a full fresh window for
-// the second call on top of the first). missDelay is chosen large relative
-// to sharedDeadlineJitterAllowance so the two stay clearly separated even
-// with that much one-time startup jitter added to whichever is observed.
+// getting their own — checked from both directions.
+//
+// A shared deadline totals ~promptBound, independent of the missDelay/tax
+// split within it: ctx's deadline is absolute from the moment
+// promptOperationContext is called, so once the first (missed) call
+// returns, the second (hanging) call gets whatever of promptBound is left
+// and is killed when the shared deadline arrives, regardless of how much
+// of it the first call used. Two failure shapes on either side of that
+// total are what the lower and upper bounds each catch:
+//
+//   - Too fast (below the lower bound): the second call reverted to an
+//     independent short bound (e.g. k.timeout) instead of sharing ctx —
+//     round 2's "silently revertible with CI green" finding, which an
+//     upper-bound-only assertion cannot see at all, because a call that
+//     returns early never risks exceeding an upper bound.
+//   - Too slow (above the upper bound): the second call reverted to an
+//     independent *fresh* runSecurity-style deadline instead of sharing
+//     ctx, taking ~missDelay+promptBound instead of ~promptBound.
+//
+// missDelay is sized to separate the "too fast" and "too slow" totals from
+// the correct one by more than sharedDeadlineMargin(promptBound) even in
+// the worst case measured for this environment's one-time
+// per-fresh-executable startup cost (up to ~400ms, see
+// newDelayedMissThenHangingKeychain's doc comment) landing entirely on one
+// side or the other; promptBound is sized to comfortably exceed
+// missDelay plus that same worst case, so the first call always completes
+// on its own before the shared deadline could fire mid-sleep and trigger
+// the unrelated grandchild/WaitDelay wait TestRunSecurity_
+// WaitDelayBoundsGrandchildHoldingPipe covers.
+//
+// Deliberately not t.Parallel(), for the same reason
+// TestRunSecurityBounded_TimeoutIncludesChildStderr gives: a context's
+// deadline is wall-clock, absolute, and set before the process it bounds
+// has necessarily started, so heavy CPU contention from sibling tests
+// forking their own stand-in processes at the same time can delay actual
+// process start long enough to eat into that budget before the process
+// does any observable work — measured directly here: under full-suite
+// `-count=1` contention this test's own mutation-verification run (revert
+// the internet-password leg to an independent runSecurity call, expected
+// ~1.3-1.8s) landed anywhere from 1.00s (indistinguishable from the
+// correct, shared-deadline case) to 1.72s (correctly over the ceiling)
+// across three consecutive full-suite runs. Isolated (`-run`, no sibling
+// contention) it failed reliably every time. Running serially removes that
+// contention the same way it did for the sibling test.
 func TestFindPassword_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
-	t.Parallel()
 	const (
 		shortTimeout = 20 * time.Millisecond
-		missDelay    = 3000 * time.Millisecond
-		promptBound  = 5000 * time.Millisecond
+		missDelay    = 300 * time.Millisecond
+		promptBound  = 1000 * time.Millisecond
 	)
 	k := newDelayedMissThenHangingKeychain(t, shortTimeout, promptBound, missDelay, "find-generic-password")
 
@@ -1520,7 +1612,12 @@ func TestFindPassword_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
 	_, err := k.GetPassword("irrelevant")
 	elapsed := time.Since(start)
 
-	if upper := promptBound + sharedDeadlineJitterAllowance; elapsed > upper {
+	margin := sharedDeadlineMargin(promptBound)
+	if lower := promptBound - margin; elapsed < lower {
+		t.Errorf("GetPassword() took %s, want at least %s: a second call that returns before the shared deadline reverted to its own independent (and shorter) bound instead of sharing promptOperationContext's",
+			elapsed, lower)
+	}
+	if upper := promptBound + margin; elapsed > upper {
 		t.Errorf("GetPassword() took %s, want it bounded near promptBound (%s, limit %s): the generic and internet attempts must share one deadline, not each get their own (independent deadlines would total ~%s)",
 			elapsed, promptBound, upper, missDelay+promptBound)
 	}
@@ -1533,15 +1630,16 @@ func TestFindPassword_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
 // delete-generic-password and delete-internet-password. It is not
 // redundant with the findPassword test: Delete calls
 // runSecurityBoundedCtx directly rather than through findPassword, so a
-// regression here (e.g. Delete's second call reintroducing a fresh
-// runSecurityPrompt-style deadline) would not be caught by the findPassword
-// test alone.
+// regression here (e.g. Delete's second call reverting to an independent
+// deadline) would not be caught by the findPassword test alone. See that
+// test's doc comment for the full reasoning behind the constants and
+// bounds, shared verbatim here — including why this is deliberately not
+// t.Parallel() either.
 func TestDelete_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
-	t.Parallel()
 	const (
 		shortTimeout = 20 * time.Millisecond
-		missDelay    = 3000 * time.Millisecond
-		promptBound  = 5000 * time.Millisecond
+		missDelay    = 300 * time.Millisecond
+		promptBound  = 1000 * time.Millisecond
 	)
 	k := newDelayedMissThenHangingKeychain(t, shortTimeout, promptBound, missDelay, "delete-generic-password")
 
@@ -1549,7 +1647,12 @@ func TestDelete_SharesOneDeadlineAcrossBothCalls(t *testing.T) {
 	err := k.Delete("irrelevant")
 	elapsed := time.Since(start)
 
-	if upper := promptBound + sharedDeadlineJitterAllowance; elapsed > upper {
+	margin := sharedDeadlineMargin(promptBound)
+	if lower := promptBound - margin; elapsed < lower {
+		t.Errorf("Delete() took %s, want at least %s: a second call that returns before the shared deadline reverted to its own independent (and shorter) bound instead of sharing promptOperationContext's",
+			elapsed, lower)
+	}
+	if upper := promptBound + margin; elapsed > upper {
 		t.Errorf("Delete() took %s, want it bounded near promptBound (%s, limit %s): the generic and internet attempts must share one deadline, not each get their own (independent deadlines would total ~%s)",
 			elapsed, promptBound, upper, missDelay+promptBound)
 	}
