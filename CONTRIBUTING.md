@@ -7,7 +7,7 @@ This guide covers setting up a local development environment on Windows or macOS
 Install the following tools via [Homebrew](https://brew.sh):
 
 ```sh
-brew install go               # Go 1.25+ (CI uses 1.25; any later release works)
+brew install go               # Go 1.26+ (CI uses 1.26; any later release works)
 brew install gh               # GitHub CLI — used for cloning and creating PRs
 brew install goreleaser       # for release dry-runs
 ```
@@ -31,7 +31,7 @@ The default `Keychain` backend calls the built-in `/usr/bin/security` CLI via `o
 Install the following tools via [winget](https://learn.microsoft.com/windows/package-manager/winget/):
 
 ```powershell
-winget install --id GoLang.Go -e          # Go 1.25+ (CI uses 1.25; any later release works)
+winget install --id GoLang.Go -e          # Go 1.26+ (CI uses 1.26; any later release works)
 winget install --id Git.Git -e
 winget install --id GitHub.cli -e         # gh — used for cloning and creating PRs
 winget install --id goreleaser.goreleaser -e  # goreleaser — for release dry-runs
