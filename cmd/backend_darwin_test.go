@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -312,5 +313,58 @@ func TestRunGitCredentialHelper_UnrecognisedBackendEnv(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "typo") {
 		t.Errorf("expected stderr to mention the offending value, got %q", stderr.String())
+	}
+}
+
+// The trim itself lives in backendEnvValue (issue #64); these confirm both
+// darwin call sites go through it.
+func TestSelectBackend_Darwin_EnvWhitespaceIsTrimmed(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want any
+	}{
+		{"keychain ", &backend.Keychain{}},
+		{" keychain", &backend.Keychain{}},
+		{"\tpasswords-app\n", &backend.PasswordsApp{}},
+		{"  \t ", &backend.Keychain{}}, // whitespace only == unset == default
+	} {
+		t.Run(fmt.Sprintf("%q", tc.in), func(t *testing.T) {
+			resetDarwinBackendOverrides(t)
+			t.Setenv("SECRET_BACKEND", tc.in)
+
+			b, err := selectBackend()
+			if err != nil {
+				t.Fatalf("SECRET_BACKEND=%q: unexpected error: %v", tc.in, err)
+			}
+			if fmt.Sprintf("%T", b) != fmt.Sprintf("%T", tc.want) {
+				t.Fatalf("SECRET_BACKEND=%q: got %T, want %T", tc.in, b, tc.want)
+			}
+		})
+	}
+}
+
+func TestSelectBackend_Darwin_WrongCaseStillRejected(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	t.Setenv("SECRET_BACKEND", " Keychain ")
+
+	if b, err := selectBackend(); err == nil {
+		t.Fatalf("expected an error, got backend %T", b)
+	} else if !strings.Contains(err.Error(), `"Keychain"`) {
+		t.Errorf("error %q should show the trimmed value", err.Error())
+	}
+}
+
+func TestSelectBackend_Darwin_FlagPathNoWarningForPaddedValidEnv(t *testing.T) {
+	resetDarwinBackendOverrides(t)
+	forcePasswordsApp = true
+	t.Setenv("SECRET_BACKEND", "keychain ")
+
+	stderr := captureStderr(t, func() {
+		if _, err := selectBackend(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if stderr != "" {
+		t.Errorf("expected no warning for a padded but valid SECRET_BACKEND, got %q", stderr)
 	}
 }

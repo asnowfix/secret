@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/asnowfix/secret/backend"
-	"github.com/spf13/viper"
 )
 
 // forceKeychain backs the long-shipped, documented -k/--keychain flag.
@@ -73,7 +72,7 @@ func selectBackend() (backend.Backend, error) {
 		validateBackendEnvIgnoredByFlag()
 		return backend.NewPasswordsApp(), nil
 	}
-	return resolveBackendName(viper.GetString("backend"))
+	return resolveBackendName(backendEnvValue())
 }
 
 // resolveBackendName is the single source of truth for "which SECRET_BACKEND
@@ -111,7 +110,7 @@ func resolveBackendName(name string) (backend.Backend, error) {
 // that a script or alias with --passwords-app baked in keeps working
 // regardless of what an inherited environment variable holds.
 func validateBackendEnvIgnoredByFlag() {
-	name := viper.GetString("backend")
+	name := backendEnvValue()
 	if _, err := resolveBackendName(name); err != nil {
 		fmt.Fprintf(os.Stderr, "secret: warning: %v (ignored: --passwords-app was given)\n", err)
 	}

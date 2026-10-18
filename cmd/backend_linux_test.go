@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -188,5 +189,35 @@ func TestTrampolineTargetName(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, c.wanted)
 			}
 		})
+	}
+}
+
+// The trim itself lives in backendEnvValue (issue #64); this confirms the
+// linux call site goes through it.
+func TestSelectBackend_Linux_EnvWhitespaceIsTrimmed(t *testing.T) {
+	for _, in := range []string{"secret-service ", " secret-service", "\tsecret-service\n", " \t "} {
+		t.Run(fmt.Sprintf("%q", in), func(t *testing.T) {
+			skipOnWSL(t)
+			t.Setenv("SECRET_BACKEND", in)
+
+			b, err := selectBackend()
+			if err != nil {
+				t.Fatalf("SECRET_BACKEND=%q: unexpected error: %v", in, err)
+			}
+			if _, ok := b.(*backend.SecretService); !ok {
+				t.Fatalf("SECRET_BACKEND=%q: got %T, want *backend.SecretService", in, b)
+			}
+		})
+	}
+}
+
+func TestSelectBackend_Linux_WrongCaseStillRejected(t *testing.T) {
+	skipOnWSL(t)
+	t.Setenv("SECRET_BACKEND", " Secret-Service ")
+
+	if b, err := selectBackend(); err == nil {
+		t.Fatalf("expected an error, got backend %T", b)
+	} else if !strings.Contains(err.Error(), `"Secret-Service"`) {
+		t.Errorf("error %q should show the trimmed value", err.Error())
 	}
 }
