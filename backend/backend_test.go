@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -50,5 +51,18 @@ func TestDedupeSortServices(t *testing.T) {
 				t.Errorf("DedupeSortServices(%v) = %v, want %v", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAmbiguityError(t *testing.T) {
+	for count, wantErr := range map[int]bool{0: false, 1: false, 2: true, 5: true} {
+		err := ambiguityError("svc", count)
+		var amb *ErrAmbiguous
+		if got := errors.As(err, &amb); got != wantErr {
+			t.Errorf("count %d: ambiguous = %v, want %v (err %v)", count, got, wantErr, err)
+		}
+		if wantErr && (amb.Count != count || amb.Service != "svc") {
+			t.Errorf("count %d: got %+v", count, amb)
+		}
 	}
 }

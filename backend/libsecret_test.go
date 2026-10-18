@@ -553,36 +553,78 @@ func TestSecretService_Add_Error(t *testing.T) {
 	}
 }
 
-func TestSecretService_Delete(t *testing.T) {
-	var deletedPaths []dbus.ObjectPath
+// deleteFixture registers a fake bus whose SearchItems reply has the given
+// unlocked and locked item paths, every one an own item, and records which
+// ones Item.Delete was called on.
+func deleteFixture(t *testing.T, unlocked, locked []dbus.ObjectPath) (*SecretService, *[]dbus.ObjectPath) {
+	t.Helper()
+	deleted := &[]dbus.ObjectPath{}
 	bus := newFakeBus(t)
-	bus.register(&fakeObject{
-		path: secretsPath,
-		call: searchItemsCall([]dbus.ObjectPath{"/item/1"}, []dbus.ObjectPath{"/item/2"}),
-	})
-	deleteHandler := func(path dbus.ObjectPath) func(string, []interface{}) *dbus.Call {
-		return func(method string, args []interface{}) *dbus.Call {
-			if method != ifaceItem+".Delete" {
-				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
-			}
-			deletedPaths = append(deletedPaths, path)
-			return &dbus.Call{Body: []interface{}{rootPath}}
-		}
-	}
+	bus.register(&fakeObject{path: secretsPath, call: searchItemsCall(unlocked, locked)})
 	// searchItems (via filterOwnItems) reads Attributes on every candidate,
 	// locked or not, to confirm ownership before Delete ever touches it.
 	ownAttrs := func(string) (dbus.Variant, error) {
 		return dbus.MakeVariant(map[string]string{attrService: "svc"}), nil
 	}
-	bus.register(&fakeObject{path: "/item/1", call: deleteHandler("/item/1"), prop: ownAttrs})
-	bus.register(&fakeObject{path: "/item/2", call: deleteHandler("/item/2"), prop: ownAttrs})
-
-	s := newTestService(bus)
-	if err := s.Delete("svc"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for _, path := range append(append([]dbus.ObjectPath{}, unlocked...), locked...) {
+		path := path
+		bus.register(&fakeObject{path: path, prop: ownAttrs, call: func(method string, _ []interface{}) *dbus.Call {
+			if method != ifaceItem+".Delete" {
+				return &dbus.Call{Err: fmt.Errorf("unexpected method %s", method)}
+			}
+			*deleted = append(*deleted, path)
+			return &dbus.Call{Body: []interface{}{rootPath}}
+		}})
 	}
-	if len(deletedPaths) != 2 {
-		t.Fatalf("expected both matching items deleted, got %v", deletedPaths)
+	return newTestService(bus), deleted
+}
+
+// TestSecretService_Delete_SingleItem: exactly one own item is deleted,
+// whether it sits in the unlocked or the locked half of the reply.
+func TestSecretService_Delete_SingleItem(t *testing.T) {
+	for name, tc := range map[string]struct{ unlocked, locked []dbus.ObjectPath }{
+		"unlocked": {unlocked: []dbus.ObjectPath{"/item/1"}},
+		"locked":   {locked: []dbus.ObjectPath{"/item/1"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, deleted := deleteFixture(t, tc.unlocked, tc.locked)
+			if err := s.Delete("svc"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(*deleted) != 1 || (*deleted)[0] != "/item/1" {
+				t.Fatalf("expected /item/1 deleted, got %v", *deleted)
+			}
+		})
+	}
+}
+
+// TestSecretService_Delete_AmbiguousRefusesAndDeletesNothing is issue #49:
+// more than one own item for the service, however split between unlocked
+// and locked, is *ErrAmbiguous and nothing is deleted.
+func TestSecretService_Delete_AmbiguousRefusesAndDeletesNothing(t *testing.T) {
+	cases := map[string]struct {
+		unlocked, locked []dbus.ObjectPath
+	}{
+		"two unlocked": {unlocked: []dbus.ObjectPath{"/item/1", "/item/2"}},
+		"two locked":   {locked: []dbus.ObjectPath{"/item/1", "/item/2"}},
+		"one of each":  {unlocked: []dbus.ObjectPath{"/item/1"}, locked: []dbus.ObjectPath{"/item/2"}},
+		"three, mixed": {unlocked: []dbus.ObjectPath{"/item/1", "/item/2"}, locked: []dbus.ObjectPath{"/item/3"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, deleted := deleteFixture(t, tc.unlocked, tc.locked)
+			err := s.Delete("svc")
+			var amb *ErrAmbiguous
+			if !errors.As(err, &amb) {
+				t.Fatalf("expected *ErrAmbiguous, got %v (%T)", err, err)
+			}
+			if want := len(tc.unlocked) + len(tc.locked); amb.Count != want || amb.Service != "svc" {
+				t.Fatalf("got %+v, want Service svc Count %d", amb, want)
+			}
+			if len(*deleted) != 0 {
+				t.Fatalf("nothing may be deleted on ambiguity, got %v", *deleted)
+			}
+		})
 	}
 }
 

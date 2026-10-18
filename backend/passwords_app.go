@@ -310,6 +310,47 @@ static char* sec_copy_all_services(OSStatus *stGeneric, OSStatus *stInternet) {
 	return result;
 }
 
+// sec_count_items counts the items matching name in each class, using the same
+// no-UI query discipline as the rest of this file and kSecMatchLimitAll. A
+// count stays 0 when its query did not succeed (the status says why). It exists
+// so Delete can refuse when more than one item matches (issue #49), since
+// SecItemDelete removes every match.
+static void sec_count_items(const char *name, OSStatus *stGeneric, OSStatus *stInternet, int *nGeneric, int *nInternet) {
+	CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	*stGeneric = errSecItemNotFound;
+	*stInternet = errSecItemNotFound;
+	*nGeneric = 0;
+	*nInternet = 0;
+
+	{
+		const void *k[] = {kSecClass, kSecAttrService, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassGenericPassword, n, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
+		CFTypeRef r = NULL;
+		*stGeneric = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*stGeneric == errSecSuccess && r) {
+			*nGeneric = (int)CFArrayGetCount((CFArrayRef)r);
+		}
+		if (r) CFRelease(r);
+	}
+
+	{
+		const void *k[] = {kSecClass, kSecAttrServer, kSecReturnAttributes, kSecMatchLimit, kSecAttrSynchronizable};
+		const void *v[] = {kSecClassInternetPassword, n, kCFBooleanTrue, kSecMatchLimitAll, kSecAttrSynchronizableAny};
+		CFDictionaryRef q = _no_ui_dict(k, v, 5);
+		CFTypeRef r = NULL;
+		*stInternet = SecItemCopyMatching(q, &r);
+		CFRelease(q);
+		if (*stInternet == errSecSuccess && r) {
+			*nInternet = (int)CFArrayGetCount((CFArrayRef)r);
+		}
+		if (r) CFRelease(r);
+	}
+
+	CFRelease(n);
+}
+
 // sec_delete_item deletes an item by service name.
 // Tries kSecClassGenericPassword then kSecClassInternetPassword.
 // kSecAttrSynchronizableAny ensures iCloud-synced items can be deleted too.
@@ -615,12 +656,30 @@ func (p *PasswordsApp) Delete(service string) error {
 	refuseKeychainUI()
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
+	// Count first and refuse on ambiguity (issue #49): SecItemDelete removes
+	// every match, whereas the read path returns one. A failed count query
+	// leaves its count at 0 and falls through to the delete, which reports
+	// the same failure through its own statuses.
+	var cntGeneric, cntInternet C.OSStatus
+	var nGeneric, nInternet C.int
+	C.sec_count_items(svc, &cntGeneric, &cntInternet, &nGeneric, &nInternet)
+	if err := passwordsAppDeleteAmbiguity(service, int(nGeneric), int(nInternet)); err != nil {
+		return err
+	}
 	var stGeneric, stInternet C.OSStatus
 	C.sec_delete_item(svc, &stGeneric, &stInternet)
 	if int32(stGeneric) == secSuccessStatus || int32(stInternet) == secSuccessStatus {
 		return nil
 	}
 	return classifyPasswordsAppDelete(service, int32(stGeneric), int32(stInternet))
+}
+
+// passwordsAppDeleteAmbiguity turns the per-class match counts from
+// sec_count_items into *ErrAmbiguous when they total more than one. Items in
+// both classes count as ambiguous too (the #43 principle). Pure Go so a darwin
+// test can drive it without a keychain.
+func passwordsAppDeleteAmbiguity(service string, nGeneric, nInternet int) error {
+	return ambiguityError(service, nGeneric+nInternet)
 }
 
 func (p *PasswordsApp) Edit() error {

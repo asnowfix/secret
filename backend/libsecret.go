@@ -391,6 +391,12 @@ func (s *SecretService) Delete(service string) error {
 	if len(items) == 0 {
 		return &ErrNotFound{Service: service}
 	}
+	// Refuse, deleting nothing, when the service is ambiguous (issue #49):
+	// the read path picks one item (pickItem) while this would remove all of
+	// them, so a second account's credential would be destroyed silently.
+	if err := ambiguityError(service, len(items)); err != nil {
+		return err
+	}
 	isLocked := make(map[dbus.ObjectPath]bool, len(locked))
 	for _, l := range locked {
 		isLocked[l] = true
@@ -529,9 +535,13 @@ func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, map[string
 
 // pickItem returns the first candidate item, if any. Multiple items can
 // exist for the same service if they were created under different accounts
-// (see Add's doc comment); we deterministically pick the first one Secret
-// Service returns, mirroring the ambiguity accepted by the macOS and
-// Windows backends' single-match-by-service-name lookups.
+// (see Add's doc comment); we pick the first one Secret Service returns,
+// mirroring the ambiguity accepted by the macOS and Windows backends'
+// single-match-by-service-name lookups. That order is stable only within one
+// SearchItems reply: the spec defines no ordering, and the unlocked/locked
+// split can change between calls, so two calls (GetUsername, then Delete)
+// are not guaranteed to agree on which item is first. Delete therefore does
+// not rely on it and refuses on ambiguity instead (*ErrAmbiguous, issue #49).
 func pickItem(candidates []dbus.ObjectPath) (dbus.ObjectPath, bool) {
 	if len(candidates) == 0 {
 		return "", false

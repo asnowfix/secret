@@ -19,7 +19,9 @@ type Backend interface {
 	// Add stores a credential (service, account, password) in the backend.
 	Add(service, account, password string) error
 
-	// Delete removes the credential for the given service.
+	// Delete removes the credential for the given service. A backend that can
+	// hold several items for one service must delete none of them and return
+	// *ErrAmbiguous when more than one matches (issue #49).
 	Delete(service string) error
 
 	// Edit opens the backend's native UI for credential management.
@@ -66,6 +68,31 @@ type ErrNotSupported struct {
 
 func (e *ErrNotSupported) Error() string {
 	return fmt.Sprintf("%s is not supported by this backend", e.Op)
+}
+
+// ErrAmbiguous is returned by Delete, having deleted nothing, when more than
+// one item matches the service. Count is how many matched. A destructive
+// operation may remove only the credential the request definitively
+// identifies; with several candidates the backend cannot say which one that
+// is, so the user has to resolve it by hand in the native tool (issue #49).
+type ErrAmbiguous struct {
+	Service string
+	Count   int
+}
+
+func (e *ErrAmbiguous) Error() string {
+	return fmt.Sprintf("%d items match '%s', refusing to delete without knowing which one is meant", e.Count, e.Service)
+}
+
+// ambiguityError returns *ErrAmbiguous when count is greater than one, and
+// nil otherwise. It is the single count-to-error decision shared by the
+// backends whose Delete can remove several items (SecretService,
+// PasswordsApp), kept free of any platform API so it is testable everywhere.
+func ambiguityError(service string, count int) error {
+	if count > 1 {
+		return &ErrAmbiguous{Service: service, Count: count}
+	}
+	return nil
 }
 
 // DedupeSortServices removes duplicate service names (an exact,

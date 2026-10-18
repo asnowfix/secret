@@ -567,3 +567,36 @@ func TestPasswordsAppMethodsReturnTypedErrors(t *testing.T) {
 			"this test is no longer looking at what it thinks it is", checked)
 	}
 }
+
+// TestPasswordsAppDeleteAmbiguity drives the count-to-error decision Delete
+// makes between sec_count_items and sec_delete_item (issue #49), without a
+// keychain. Counts are per class; items in both classes are ambiguous too.
+func TestPasswordsAppDeleteAmbiguity(t *testing.T) {
+	cases := []struct {
+		name                string
+		nGeneric, nInternet int
+		wantCount           int // 0 means no error
+	}{
+		{"none", 0, 0, 0},
+		{"one generic", 1, 0, 0},
+		{"one internet", 0, 1, 0},
+		{"two generic", 2, 0, 2},
+		{"two internet", 0, 2, 2},
+		{"one in each class", 1, 1, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := passwordsAppDeleteAmbiguity("svc", tc.nGeneric, tc.nInternet)
+			if tc.wantCount == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			var amb *ErrAmbiguous
+			if !errors.As(err, &amb) || amb.Count != tc.wantCount {
+				t.Fatalf("got %v, want *ErrAmbiguous with Count %d", err, tc.wantCount)
+			}
+		})
+	}
+}

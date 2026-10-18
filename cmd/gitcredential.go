@@ -315,14 +315,37 @@ func gitCredentialStore(b backend.Backend, in gitCredentialInput, stderr io.Writ
 	if service == "" || in.password == "" {
 		return
 	}
+	// This is the non-interactive counterpart of the "[y/N]" overwrite
+	// prompt in `secret set` (cmd/set.go). Git cannot answer a prompt, so the
+	// guard takes the prompt's default, N, whenever "yes" would rest on
+	// something unverified: a store naming a different username than the one
+	// stored, or an indeterminate read, refuses and changes nothing. The same
+	// username (a password update) and a definitive absence proceed. Without
+	// this, a store for bob silently destroyed alice's credential, which no
+	// reference git helper does (#47).
+	current, err := b.GetUsername(service)
+	if proceed, refusal := classifyStoreTarget(in.username, current, err); !proceed {
+		if errors.Is(refusal, errStoreUsernameDiffers) {
+			fmt.Fprintf(stderr, "git-credential-secret: a credential for a different username is already stored for '%s', not replacing it with this one (username %q, stored %q): to replace it deliberately run `secret set %s <user> <password>`, or remove it with `secret delete %s`\n", service, in.username, current, service, service)
+		} else {
+			fmt.Fprintf(stderr, "git-credential-secret: could not determine which username is stored for '%s', refusing to replace a credential that may not be the one git is storing: %v — retry once the store is readable, or remove it by hand with `secret delete %s`\n", service, refusal, service)
+		}
+		return
+	}
 	// Add is not guaranteed to replace an existing credential on every
 	// backend — the macOS Keychain backend's `security add-generic-password`
 	// fails on a duplicate rather than overwriting it — so remove any
 	// existing entry first, mirroring `secret set`'s overwrite path
 	// (cmd/set.go). Not finding one to remove is the common case, not a
-	// failure worth reporting.
+	// failure worth reporting. More than one matching item (#49) is a
+	// refusal: Delete removed nothing, so Add would only pile on.
 	if err := b.Delete(service); err != nil {
 		var notFound *backend.ErrNotFound
+		var ambiguous *backend.ErrAmbiguous
+		if errors.As(err, &ambiguous) {
+			fmt.Fprintf(stderr, "git-credential-secret: %d items are stored for '%s', not replacing any of them: %s\n", ambiguous.Count, service, ambiguousRemedy(service))
+			return
+		}
 		if !errors.As(err, &notFound) {
 			fmt.Fprintf(stderr, "git-credential-secret: could not remove existing credential for '%s' before store: %v\n", service, err)
 		}
@@ -373,10 +396,59 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 	}
 	if err := b.Delete(service); err != nil {
 		var notFound *backend.ErrNotFound
+		var ambiguous *backend.ErrAmbiguous
+		if errors.As(err, &ambiguous) {
+			// Cause first, remedy second, as for the indeterminate refusal
+			// above. Nothing was deleted (#49).
+			fmt.Fprintf(stderr, "git-credential-secret: %d items are stored for '%s', refusing to erase without knowing which one git meant: %s\n", ambiguous.Count, service, ambiguousRemedy(service))
+			return
+		}
 		if !errors.As(err, &notFound) {
 			fmt.Fprintf(stderr, "git-credential-secret: failed to erase credential for '%s': %v\n", service, err)
 		}
 	}
+}
+
+// ambiguousRemedy is the remedy half of the cause-then-remedy line printed
+// when a backend refuses a delete with *backend.ErrAmbiguous (#49): `secret`
+// cannot choose between the items, so the user removes the extra one in the
+// native tool.
+func ambiguousRemedy(service string) string {
+	return fmt.Sprintf("remove the extra item for '%s' in the native tool (Seahorse or Keychain Access), then retry", service)
+}
+
+// errStoreUsernameDiffers is classifyStoreTarget's refusal for a store naming
+// a different username than the one stored.
+var errStoreUsernameDiffers = errors.New("a credential for a different username is already stored")
+
+// classifyStoreTarget decides whether a store request may replace the
+// credential currently held for that service, given the username git is
+// storing (incoming), the username currently stored (current) and the error
+// GetUsername returned reading it. It mirrors classifyEraseTarget (the same
+// principle: only a definitive answer authorises a destructive step) and is
+// the non-interactive counterpart of classifySetTarget plus `secret set`'s
+// "[y/N]" prompt (#47):
+//
+//   - *backend.ErrNotFound: proceed. Nothing stored, nothing to lose.
+//   - read succeeded, usernames equal: proceed (Delete then Add, a password
+//     update).
+//   - read succeeded, usernames differ — including either side empty, since
+//     an empty username is not evidence of the same account: refuse, so
+//     nothing is deleted or added.
+//   - any other read error: refuse. An indeterminate read is never
+//     permission to proceed (#42).
+func classifyStoreTarget(incoming, current string, err error) (proceed bool, refusal error) {
+	if err == nil {
+		if current == incoming {
+			return true, nil
+		}
+		return false, errStoreUsernameDiffers
+	}
+	var notFound *backend.ErrNotFound
+	if errors.As(err, &notFound) {
+		return true, nil
+	}
+	return false, err
 }
 
 // classifyEraseTarget decides whether an erase request that named a
@@ -390,8 +462,8 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 // — a locked keychain, a stale D-Bus session, a transport fault, a timeout,
 // an item whose account attribute cannot be parsed — while Delete still
 // succeeds afterwards. Letting the delete run in that case means an erase
-// naming bob destroys alice's credential, so only a definitive answer
-// authorises it:
+// naming bob may remove a credential that is not bob's, so only a definitive
+// answer authorises it:
 //
 //   - read succeeded: proceed only on an exact match, as before.
 //   - *backend.ErrNotFound: proceed. Not because the delete achieves
@@ -453,11 +525,14 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 // exception, and is unaffected.
 //
 // What this bounds, and what it does not: it stops an unverified username
-// authorising a delete. It does not make a verified one safe on its own.
-// Per #49, Delete removes every item matching the service while the read
-// picks one, so where two credentials share a service an erase matching
-// bob can still take alice's with it — the guard passes and the harm
-// happens anyway.
+// authorising a delete, and so covers the one-item-per-service case. It does
+// not cover several items sharing a service, where the read picks one while
+// Delete would remove them all: that is covered by the backend's own
+// *backend.ErrAmbiguous refusal (#49) on the backends that can hold more than
+// one item (Secret Service, Passwords.app), which gitCredentialErase reports.
+// The macOS Keychain backend deletes one item, and whether that is the one
+// the read picked is unverified (#43 is the related class mismatch, not
+// addressed here).
 func classifyEraseTarget(want, current string, err error) (proceed bool, indeterminate error) {
 	if err == nil {
 		return current == want, nil
