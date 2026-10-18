@@ -58,8 +58,9 @@ func errUnrecognisedBackend(value, goos string, validHere []string) error {
 // unrecognised-value error. That keeps to this repo's "fail explicitly,
 // don't guess" stance on ambiguous input (see errUnrecognisedBackend); a
 // wrong-case name is a typo to be reported, not silently accepted. Interior
-// whitespace is also left alone, and shows up escaped in the error because
-// errUnrecognisedBackend formats the value with %q.
+// whitespace is also left alone, and shows up quoted in the error (control
+// whitespace such as a tab escaped) because errUnrecognisedBackend formats
+// the value with %q.
 func backendEnvValue() string {
 	return strings.TrimSpace(viper.GetString("backend"))
 }
