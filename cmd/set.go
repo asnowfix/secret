@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -43,8 +44,8 @@ var setCmd = &cobra.Command{
 					return nil
 				}
 			}
-			if err := b.Delete(service); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not remove old credential: %v\n", err)
+			if err := removeOldCredential(b, service, os.Stderr); err != nil {
+				return err
 			}
 		}
 
@@ -71,6 +72,24 @@ var setCmd = &cobra.Command{
 func init() {
 	setCmd.Flags().BoolP("yes", "y", false, "Skip confirmation when overwriting")
 	rootCmd.AddCommand(setCmd)
+}
+
+// removeOldCredential is the delete step of set's overwrite path. A failure
+// is only a warning (the following Add may still replace it) except
+// *backend.ErrAmbiguous (#49): more than one item matches, the backend
+// deleted nothing, and adding would pile a further item onto the ambiguity
+// instead of replacing anything, so set aborts.
+func removeOldCredential(be backend.Backend, service string, stderr io.Writer) error {
+	err := be.Delete(service)
+	if err == nil {
+		return nil
+	}
+	var ambiguous *backend.ErrAmbiguous
+	if errors.As(err, &ambiguous) {
+		return fmt.Errorf("%w; nothing was changed: %s", err, ambiguousRemedy(service))
+	}
+	fmt.Fprintf(stderr, "warning: could not remove old credential: %v\n", err)
+	return nil
 }
 
 // classifySetTarget interprets the error returned by GetPassword(service)
