@@ -79,14 +79,14 @@ static OSStatus sec_user_interaction_allowed(int *allowed) {
 //
 // Every dictionary in this file is created here rather than by calling
 // CFDictionaryCreate directly, so that "refuse UI" cannot be forgotten at one
-// of the seven call sites. That is not hypothetical tidiness: the defect this
+// of the call sites. That is not hypothetical tidiness: the defect this
 // function exists to fix was precisely that none of them set it.
 //
 // It builds into a mutable dictionary rather than copying into a fixed-size
 // stack buffer: with no buffer there is no size to get wrong, no bounds
 // check to get wrong (a signed CFIndex makes "n too large" and "n negative"
 // two separate mistakes), and no failure return for the callers to check —
-// so no way for this to hand back a NULL that the nine CFRelease(q) sites
+// so no way for this to hand back a NULL that the CFRelease(q) sites
 // would turn into a crash.
 static CFDictionaryRef _no_ui_dict(const void **k, const void **v, CFIndex n) {
 	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, n + 1,
@@ -657,13 +657,14 @@ func (p *PasswordsApp) Delete(service string) error {
 	svc := C.CString(service)
 	defer C.free(unsafe.Pointer(svc))
 	// Count first and refuse on ambiguity (issue #49): SecItemDelete removes
-	// every match, whereas the read path returns one. A failed count query
-	// leaves its count at 0 and falls through to the delete, which reports
-	// the same failure through its own statuses.
+	// every match, whereas the read path returns one. A count query that
+	// failed for a real reason says nothing about how many items match, and
+	// the delete could still succeed and remove several, so that too is a
+	// refusal (#42's lesson), decided in passwordsAppDeleteGuard.
 	var cntGeneric, cntInternet C.OSStatus
 	var nGeneric, nInternet C.int
 	C.sec_count_items(svc, &cntGeneric, &cntInternet, &nGeneric, &nInternet)
-	if err := passwordsAppDeleteAmbiguity(service, int(nGeneric), int(nInternet)); err != nil {
+	if err := passwordsAppDeleteGuard(service, int32(cntGeneric), int32(cntInternet), int(nGeneric), int(nInternet)); err != nil {
 		return err
 	}
 	var stGeneric, stInternet C.OSStatus
@@ -674,11 +675,18 @@ func (p *PasswordsApp) Delete(service string) error {
 	return classifyPasswordsAppDelete(service, int32(stGeneric), int32(stInternet))
 }
 
-// passwordsAppDeleteAmbiguity turns the per-class match counts from
-// sec_count_items into *ErrAmbiguous when they total more than one. Items in
-// both classes count as ambiguous too (the #43 principle). Pure Go so a darwin
-// test can drive it without a keychain.
-func passwordsAppDeleteAmbiguity(service string, nGeneric, nInternet int) error {
+// passwordsAppDeleteGuard decides, from sec_count_items' per-class statuses
+// and counts, whether Delete may go ahead: nil to proceed. A status that is
+// neither success nor not-found means that class's count is unknown, so
+// nothing is deleted and the typed *ErrUnavailable comes back (via
+// classifyPasswordsAppStatuses, as for every other failed delete). Otherwise
+// the counts total more than one is *ErrAmbiguous; items in both classes
+// count as ambiguous too (the #43 principle). Pure Go so a darwin test can
+// drive it without a keychain.
+func passwordsAppDeleteGuard(service string, stGeneric, stInternet int32, nGeneric, nInternet int) error {
+	if isRealFailure(stGeneric) || isRealFailure(stInternet) {
+		return classifyPasswordsAppStatuses("delete", service, stGeneric, stInternet)
+	}
 	return ambiguityError(service, nGeneric+nInternet)
 }
 

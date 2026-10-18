@@ -568,34 +568,53 @@ func TestPasswordsAppMethodsReturnTypedErrors(t *testing.T) {
 	}
 }
 
-// TestPasswordsAppDeleteAmbiguity drives the count-to-error decision Delete
-// makes between sec_count_items and sec_delete_item (issue #49), without a
-// keychain. Counts are per class; items in both classes are ambiguous too.
-func TestPasswordsAppDeleteAmbiguity(t *testing.T) {
+// TestPasswordsAppDeleteGuard drives the decision Delete makes between
+// sec_count_items and sec_delete_item (issue #49), without a keychain. A
+// count query that failed for a real reason leaves its count unknown, so it
+// must refuse with *ErrUnavailable and never fall through to the delete.
+func TestPasswordsAppDeleteGuard(t *testing.T) {
+	const (
+		ok       = errSecSuccessValue
+		notFound = errSecItemNotFoundValue
+		denied   = errSecInteractionNotAllowed
+	)
 	cases := []struct {
 		name                string
+		stGeneric, stIntern int32
 		nGeneric, nInternet int
-		wantCount           int // 0 means no error
+		wantAmbiguous       int // 0 means not ambiguous
+		wantUnavailable     bool
 	}{
-		{"none", 0, 0, 0},
-		{"one generic", 1, 0, 0},
-		{"one internet", 0, 1, 0},
-		{"two generic", 2, 0, 2},
-		{"two internet", 0, 2, 2},
-		{"one in each class", 1, 1, 2},
+		{name: "nothing in either class", stGeneric: notFound, stIntern: notFound},
+		{name: "one generic", stGeneric: ok, stIntern: notFound, nGeneric: 1},
+		{name: "one internet", stGeneric: notFound, stIntern: ok, nInternet: 1},
+		{name: "two generic", stGeneric: ok, stIntern: notFound, nGeneric: 2, wantAmbiguous: 2},
+		{name: "two internet", stGeneric: notFound, stIntern: ok, nInternet: 2, wantAmbiguous: 2},
+		{name: "one in each class", stGeneric: ok, stIntern: ok, nGeneric: 1, nInternet: 1, wantAmbiguous: 2},
+		{name: "generic count failed, internet empty", stGeneric: denied, stIntern: notFound, wantUnavailable: true},
+		{name: "generic count failed, internet has one", stGeneric: denied, stIntern: ok, nInternet: 1, wantUnavailable: true},
+		{name: "internet count failed, generic has one", stGeneric: ok, stIntern: denied, nGeneric: 1, wantUnavailable: true},
+		{name: "internet count failed, generic has two", stGeneric: ok, stIntern: denied, nGeneric: 2, wantUnavailable: true},
+		{name: "both counts failed", stGeneric: denied, stIntern: denied, wantUnavailable: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := passwordsAppDeleteAmbiguity("svc", tc.nGeneric, tc.nInternet)
-			if tc.wantCount == 0 {
+			err := passwordsAppDeleteGuard("svc", tc.stGeneric, tc.stIntern, tc.nGeneric, tc.nInternet)
+			var amb *ErrAmbiguous
+			var unavail *ErrUnavailable
+			switch {
+			case tc.wantUnavailable:
+				if !errors.As(err, &unavail) {
+					t.Fatalf("got %v (%T), want *ErrUnavailable", err, err)
+				}
+			case tc.wantAmbiguous > 0:
+				if !errors.As(err, &amb) || amb.Count != tc.wantAmbiguous {
+					t.Fatalf("got %v, want *ErrAmbiguous with Count %d", err, tc.wantAmbiguous)
+				}
+			default:
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				return
-			}
-			var amb *ErrAmbiguous
-			if !errors.As(err, &amb) || amb.Count != tc.wantCount {
-				t.Fatalf("got %v, want *ErrAmbiguous with Count %d", err, tc.wantCount)
 			}
 		})
 	}

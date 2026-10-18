@@ -325,10 +325,10 @@ func gitCredentialStore(b backend.Backend, in gitCredentialInput, stderr io.Writ
 	// reference git helper does (#47).
 	current, err := b.GetUsername(service)
 	if proceed, refusal := classifyStoreTarget(in.username, current, err); !proceed {
-		if errors.Is(refusal, errStoreUsernameDiffers) {
-			fmt.Fprintf(stderr, "git-credential-secret: a credential for a different username is already stored for '%s', not replacing it with this one (username %q, stored %q): to replace it deliberately run `secret set %s <user> <password>`, or remove it with `secret delete %s`\n", service, in.username, current, service, service)
-		} else {
+		if refusal != nil {
 			fmt.Fprintf(stderr, "git-credential-secret: could not determine which username is stored for '%s', refusing to replace a credential that may not be the one git is storing: %v — retry once the store is readable, or remove it by hand with `secret delete %s`\n", service, refusal, service)
+		} else {
+			fmt.Fprintf(stderr, "git-credential-secret: a credential for a different username is already stored for '%s', not replacing it with this one (username %q, stored %q): to replace it deliberately run `secret set %s <user> <password>`, or remove it with `secret delete %s`\n", service, in.username, current, service, service)
 		}
 		return
 	}
@@ -414,12 +414,8 @@ func gitCredentialErase(b backend.Backend, in gitCredentialInput, stderr io.Writ
 // cannot choose between the items, so the user removes the extra one in the
 // native tool.
 func ambiguousRemedy(service string) string {
-	return fmt.Sprintf("remove the extra item for '%s' in the native tool (Seahorse or Keychain Access), then retry", service)
+	return fmt.Sprintf("remove the extra item for '%s' in the native tool (Seahorse on Linux, Keychain Access or Passwords.app on macOS), then retry", service)
 }
-
-// errStoreUsernameDiffers is classifyStoreTarget's refusal for a store naming
-// a different username than the one stored.
-var errStoreUsernameDiffers = errors.New("a credential for a different username is already stored")
 
 // classifyStoreTarget decides whether a store request may replace the
 // credential currently held for that service, given the username git is
@@ -432,17 +428,16 @@ var errStoreUsernameDiffers = errors.New("a credential for a different username 
 //   - *backend.ErrNotFound: proceed. Nothing stored, nothing to lose.
 //   - read succeeded, usernames equal: proceed (Delete then Add, a password
 //     update).
-//   - read succeeded, usernames differ — including either side empty, since
-//     an empty username is not evidence of the same account: refuse, so
-//     nothing is deleted or added.
-//   - any other read error: refuse. An indeterminate read is never
-//     permission to proceed (#42).
+//   - read succeeded, usernames differ — including exactly one side empty,
+//     since an empty username is not evidence of the same account: refuse
+//     (proceed false, refusal nil, as classifyEraseTarget does for a
+//     mismatch), so nothing is deleted or added. Both sides empty is an
+//     exact match and proceeds.
+//   - any other read error: refuse, with the error in the refusal slot. An
+//     indeterminate read is never permission to proceed (#42).
 func classifyStoreTarget(incoming, current string, err error) (proceed bool, refusal error) {
 	if err == nil {
-		if current == incoming {
-			return true, nil
-		}
-		return false, errStoreUsernameDiffers
+		return current == incoming, nil
 	}
 	var notFound *backend.ErrNotFound
 	if errors.As(err, &notFound) {

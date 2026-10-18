@@ -86,7 +86,7 @@ func removeOldCredential(be backend.Backend, service string, stderr io.Writer) e
 	}
 	var ambiguous *backend.ErrAmbiguous
 	if errors.As(err, &ambiguous) {
-		return fmt.Errorf("%w; nothing was changed: remove the extra item for '%s' in the native tool (Seahorse on Linux, Keychain Access on macOS), then retry", err, service)
+		return fmt.Errorf("%w; nothing was changed: %s", err, ambiguousRemedy(service))
 	}
 	fmt.Fprintf(stderr, "warning: could not remove old credential: %v\n", err)
 	return nil

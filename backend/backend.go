@@ -19,9 +19,11 @@ type Backend interface {
 	// Add stores a credential (service, account, password) in the backend.
 	Add(service, account, password string) error
 
-	// Delete removes the credential for the given service. A backend that can
-	// hold several items for one service must delete none of them and return
-	// *ErrAmbiguous when more than one matches (issue #49).
+	// Delete removes the credential for the given service. A backend whose
+	// Delete removes every matching item must delete none of them and return
+	// *ErrAmbiguous when more than one matches (issue #49). The macOS Keychain
+	// backend can also hold several items per service but removes only the
+	// first match and does not refuse; that gap is out of scope (#49, #43).
 	Delete(service string) error
 
 	// Edit opens the backend's native UI for credential management.

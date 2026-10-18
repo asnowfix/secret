@@ -393,6 +393,27 @@ func TestRunGitCredentialHelper_Store(t *testing.T) {
 		if got := b.creds["github.com"]; got != [2]string{"", "anon-token"} {
 			t.Fatalf("credential changed: %+v", got)
 		}
+		if len(b.deleteCalls) != 0 || len(b.addCalls) != 0 {
+			t.Fatalf("nothing may be deleted or added: delete %v, add %v", b.deleteCalls, b.addCalls)
+		}
+		if !strings.Contains(stderr.String(), "different username") || !strings.Contains(stderr.String(), "secret delete github.com") {
+			t.Fatalf("got stderr %q, want cause then remedy", stderr.String())
+		}
+	})
+
+	// Deviation from #47's wording, accepted in review: two empty usernames
+	// are an exact match on the only identity the store holds.
+	t.Run("both usernames empty updates the password", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"", "anon-token"}
+		var stdout, stderr bytes.Buffer
+		runGitCredentialHelper(b, "store", strings.NewReader("protocol=https\nhost=github.com\npassword=new-pw\n\n"), &stdout, &stderr)
+		if got := b.creds["github.com"]; got != [2]string{"", "new-pw"} {
+			t.Fatalf("got %+v, want [ new-pw]", got)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("unexpected stderr %q", stderr.String())
+		}
 	})
 
 	t.Run("not-found read proceeds and adds", func(t *testing.T) {
@@ -402,6 +423,12 @@ func TestRunGitCredentialHelper_Store(t *testing.T) {
 		runGitCredentialHelper(b, "store", strings.NewReader("protocol=https\nhost=github.com\nusername=bob\npassword=bob-pw\n\n"), &stdout, &stderr)
 		if got := b.creds["github.com"]; got != [2]string{"bob", "bob-pw"} {
 			t.Fatalf("got %+v, want [bob bob-pw]", got)
+		}
+		if len(b.addCalls) != 1 {
+			t.Fatalf("want exactly one Add, got %v", b.addCalls)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("got stderr %q, want empty: a not-found read is a normal outcome", stderr.String())
 		}
 	})
 
@@ -574,6 +601,20 @@ func TestRunGitCredentialHelper_Erase(t *testing.T) {
 			t.Fatalf("got stderr %q, want cause then remedy", stderr.String())
 		}
 	})
+
+	t.Run("ambiguous delete refuses even when the request named no username", func(t *testing.T) {
+		b := newFakeGitCredentialBackend()
+		b.creds["github.com"] = [2]string{"bob", "s3cr3t"}
+		b.deleteErr = &backend.ErrAmbiguous{Service: "github.com", Count: 2}
+		var stdout, stderr bytes.Buffer
+		runGitCredentialHelper(b, "erase", strings.NewReader("protocol=https\nhost=github.com\n\n"), &stdout, &stderr)
+		if _, ok := b.creds["github.com"]; !ok {
+			t.Fatal("credential was erased despite an ambiguous delete")
+		}
+		if !strings.Contains(stderr.String(), "refusing to erase") || !strings.Contains(stderr.String(), "native tool") {
+			t.Fatalf("got stderr %q, want cause then remedy", stderr.String())
+		}
+	})
 }
 
 func TestClassifyStoreTarget(t *testing.T) {
@@ -582,6 +623,7 @@ func TestClassifyStoreTarget(t *testing.T) {
 		incoming, current string
 		err               error
 		proceed           bool
+		wantRefusal       bool // an indeterminate read; a username mismatch refuses with a nil error
 	}{
 		{name: "same username", incoming: "bob", current: "bob", proceed: true},
 		{name: "different username", incoming: "bob", current: "alice"},
@@ -590,9 +632,9 @@ func TestClassifyStoreTarget(t *testing.T) {
 		{name: "both empty", incoming: "", current: "", proceed: true},
 		{name: "definitively nothing stored", incoming: "bob", err: &backend.ErrNotFound{Service: "github.com"}, proceed: true},
 		{name: "wrapped not-found", incoming: "bob", err: fmt.Errorf("reading: %w", &backend.ErrNotFound{Service: "github.com"}), proceed: true},
-		{name: "backend unavailable", incoming: "bob", err: &backend.ErrUnavailable{Reason: "keychain locked"}},
-		{name: "ambiguous read", incoming: "bob", err: &backend.ErrAmbiguous{Service: "github.com", Count: 2}},
-		{name: "opaque failure", incoming: "bob", err: errors.New("timed out")},
+		{name: "backend unavailable", incoming: "bob", err: &backend.ErrUnavailable{Reason: "keychain locked"}, wantRefusal: true},
+		{name: "ambiguous read", incoming: "bob", err: &backend.ErrAmbiguous{Service: "github.com", Count: 2}, wantRefusal: true},
+		{name: "opaque failure", incoming: "bob", err: errors.New("timed out"), wantRefusal: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -603,8 +645,8 @@ func TestClassifyStoreTarget(t *testing.T) {
 			if proceed && refusal != nil {
 				t.Errorf("proceeding with a refusal %v", refusal)
 			}
-			if !proceed && refusal == nil {
-				t.Error("a refusal must carry its reason")
+			if (refusal != nil) != tt.wantRefusal {
+				t.Errorf("got refusal %v, want refusal: %t", refusal, tt.wantRefusal)
 			}
 		})
 	}

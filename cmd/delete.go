@@ -35,7 +35,7 @@ func deleteCredential(be backend.Backend, service string) error {
 	err := be.Delete(service)
 	var ambiguous *backend.ErrAmbiguous
 	if errors.As(err, &ambiguous) {
-		return fmt.Errorf("%w; nothing was deleted: remove the extra item for '%s' in the native tool (Seahorse on Linux, Keychain Access on macOS), then retry", err, service)
+		return fmt.Errorf("%w; nothing was deleted: %s", err, ambiguousRemedy(service))
 	}
 	return err
 }

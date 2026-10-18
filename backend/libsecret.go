@@ -369,8 +369,9 @@ func (s *SecretService) Add(service, account, password string) error {
 	return nil
 }
 
-// Delete removes every item tagged with attrService == service, across all
-// collections. It does *not* unlock locked items first: per the Secret
+// Delete removes the item tagged with attrService == service, across all
+// collections. If more than one own item matches it deletes nothing and
+// returns *ErrAmbiguous (issue #49); no match is *ErrNotFound. It does *not* unlock locked items first: per the Secret
 // Service spec, Item.Delete removes the item's metadata and secret without
 // requiring the caller to have read the secret first, and gnome-keyring
 // (the only provider this backend has been run against) accepts Delete on
