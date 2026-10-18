@@ -231,7 +231,7 @@ func runGitCredentialHelper(b backend.Backend, op string, stdin io.Reader, stdou
 
 	switch op {
 	case "get":
-		gitCredentialGet(b, in, stdout)
+		gitCredentialGet(b, in, stdout, stderr)
 	case "store":
 		gitCredentialStore(b, in, stderr)
 	case "erase":
@@ -250,18 +250,27 @@ func runGitCredentialHelper(b backend.Backend, op string, stdin io.Reader, stdou
 // — a miss is a normal outcome, not an error (see gitcredentials(7):
 // "A helper is free to produce ... no values at all if it has nothing
 // useful to provide").
-func gitCredentialGet(b backend.Backend, in gitCredentialInput, stdout io.Writer) {
+//
+// A *backend.ErrNotFound is exactly that kind of miss and stays silent. Any
+// other error — chiefly *backend.ErrUnavailable, which after #67 can mean
+// this call sat for up to humanResponseTimeout waiting on a keychain prompt
+// nobody answered — is reported to stderr. Before #67 a miss here cost at
+// most k.timeout (a few seconds); it can now cost minutes, and doing that
+// with zero output leaves a user staring at a hung `git push` with no way
+// to connect it to the keychain. ErrUnavailable.Reason is a fixed,
+// backend-authored diagnostic string (see backend/keychain.go,
+// backend/wincred.go, backend/libsecret.go: none of their error paths
+// interpolate a credential value into it), so unlike the credential itself
+// it is safe to print — the same reasoning gitCredentialStore and
+// gitCredentialErase already rely on for their own stderr diagnostics.
+func gitCredentialGet(b backend.Backend, in gitCredentialInput, stdout, stderr io.Writer) {
 	service := gitCredentialServiceKey(in)
 	if service == "" {
 		return
 	}
 	username, err := b.GetUsername(service)
 	if err != nil {
-		// Deliberately not logged, even to stderr: on a re-locked keyring or
-		// similar transient failure this error could in principle echo back
-		// partial credential state, and there is nothing a git user could do
-		// with it anyway — a miss is a miss from git's perspective either
-		// way.
+		reportGitCredentialGetMiss(stderr, service, err)
 		return
 	}
 	if in.username != "" && in.username != username {
@@ -273,10 +282,23 @@ func gitCredentialGet(b backend.Backend, in gitCredentialInput, stdout io.Writer
 	}
 	password, err := b.GetPassword(service)
 	if err != nil {
+		reportGitCredentialGetMiss(stderr, service, err)
 		return
 	}
 	fmt.Fprintf(stdout, "username=%s\n", username)
 	fmt.Fprintf(stdout, "password=%s\n", password)
+}
+
+// reportGitCredentialGetMiss writes a diagnostic for a gitCredentialGet
+// lookup failure, unless it is a plain *backend.ErrNotFound — an ordinary
+// miss, not worth a word. See gitCredentialGet's doc comment for why every
+// other error is safe, and worth reporting.
+func reportGitCredentialGetMiss(stderr io.Writer, service string, err error) {
+	var notFound *backend.ErrNotFound
+	if errors.As(err, &notFound) {
+		return
+	}
+	fmt.Fprintf(stderr, "git-credential-secret: could not look up credential for '%s': %v\n", service, err)
 }
 
 // gitCredentialStore persists a credential git obtained interactively (or

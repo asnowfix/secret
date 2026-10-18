@@ -4,7 +4,6 @@ package cmd
 
 import (
 	"github.com/asnowfix/secret/backend"
-	"github.com/spf13/viper"
 )
 
 // windowsBackendNames lists the SECRET_BACKEND values accepted on Windows,
@@ -18,7 +17,7 @@ import (
 var windowsBackendNames = []string{"credential-manager"}
 
 func selectBackend() (backend.Backend, error) {
-	switch name := viper.GetString("backend"); name {
+	switch name := backendEnvValue(); name {
 	case "", "credential-manager":
 		return backend.NewCredentialManager(), nil
 	default:

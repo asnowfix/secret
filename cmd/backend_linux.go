@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/asnowfix/secret/backend"
-	"github.com/spf13/viper"
 )
 
 // linuxBackendNames lists the SECRET_BACKEND values accepted by the native
@@ -41,7 +40,7 @@ func selectBackend() (backend.Backend, error) {
 	// Native Secret Service backend (GNOME Keyring, KWallet, ...). Only one
 	// value is accepted today, but an unrecognised one is still a hard
 	// error rather than a silent fall-back (issue #7's design question 1).
-	switch name := viper.GetString("backend"); name {
+	switch name := backendEnvValue(); name {
 	case "", "secret-service":
 		return backend.NewSecretService(), nil
 	default:

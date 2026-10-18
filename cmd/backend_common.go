@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"strings"
+
+	"github.com/spf13/viper"
 )
 
 // knownBackendNames maps every SECRET_BACKEND value recognised on *any*
@@ -38,4 +40,27 @@ func errUnrecognisedBackend(value, goos string, validHere []string) error {
 	}
 	return fmt.Errorf("SECRET_BACKEND=%q is not a recognised backend; valid values here are: %s",
 		value, valid)
+}
+
+// backendEnvValue returns the SECRET_BACKEND value every platform's backend
+// selection must use, read via Viper (cmd/root.go maps the "backend" key to
+// that env var). It is the one place the variable is read, so a new call
+// site cannot forget to normalise it (issue #64).
+//
+// Surrounding whitespace is trimmed, because it is almost always an
+// invisible accident (a trailing space or newline from a shell profile, a
+// .env file or a CI variable) and otherwise surfaces as a confusing
+// unrecognised-value error about a name that looks right. A value that is
+// only whitespace therefore becomes "", i.e. the same as unset, which means
+// the platform default.
+//
+// The value is deliberately NOT case-folded: "Keychain" stays an
+// unrecognised-value error. That keeps to this repo's "fail explicitly,
+// don't guess" stance on ambiguous input (see errUnrecognisedBackend); a
+// wrong-case name is a typo to be reported, not silently accepted. Interior
+// whitespace is also left alone, and shows up quoted in the error (control
+// whitespace such as a tab escaped) because errUnrecognisedBackend formats
+// the value with %q.
+func backendEnvValue() string {
+	return strings.TrimSpace(viper.GetString("backend"))
 }

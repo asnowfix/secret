@@ -43,8 +43,9 @@ func init() {
 
 // selectBackend is implemented per-platform in backend_*.go files. Each
 // implementation reads the SECRET_BACKEND environment variable via
-// viper.GetString("backend") (Viper's SetEnvPrefix+AutomaticEnv above maps
-// that key to the SECRET_BACKEND env var) to override the platform default
+// backendEnvValue() (cmd/backend_common.go: viper.GetString("backend") with
+// surrounding whitespace trimmed; Viper's SetEnvPrefix+AutomaticEnv above
+// maps that key to the SECRET_BACKEND env var) to override the platform default
 // at runtime — see issue #7. It returns an error for a SECRET_BACKEND value
 // it does not recognise on the current platform rather than silently
 // falling back to the default.

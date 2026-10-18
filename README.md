@@ -257,7 +257,7 @@ go build .        # local binary
 go install .      # install to $GOPATH/bin
 ```
 
-Requires Go 1.25+. For full contributor setup (Windows winget commands, local CI parity, PR workflow) see [CONTRIBUTING.md](CONTRIBUTING.md).
+Requires Go 1.26+. For full contributor setup (Windows winget commands, local CI parity, PR workflow) see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Reporting Issues
 

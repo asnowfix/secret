@@ -38,3 +38,29 @@ func TestErrUnrecognisedBackend_ValidElsewhere(t *testing.T) {
 		t.Errorf("error %q does not list the values valid on this platform", msg)
 	}
 }
+
+func TestBackendEnvValue_TrimsSurroundingWhitespace(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"unset", "", ""},
+		{"trailing space", "keychain ", "keychain"},
+		{"leading space", " keychain", "keychain"},
+		{"tab and newline", "\tkeychain\n", "keychain"},
+		{"whitespace only", " \t\r\n ", ""},
+		{"interior whitespace kept", "key chain", "key chain"},
+		{"case kept", "Keychain", "Keychain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SECRET_BACKEND", tc.in)
+			if got := backendEnvValue(); got != tc.want {
+				t.Errorf("backendEnvValue() with SECRET_BACKEND=%q = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestErrUnrecognisedBackend_ShowsInteriorWhitespaceEscaped(t *testing.T) {
+	msg := errUnrecognisedBackend("key\tchain", "darwin", []string{"keychain"}).Error()
+	if !strings.Contains(msg, `"key\tchain"`) {
+		t.Errorf("error %q does not show the tab escaped", msg)
+	}
+}

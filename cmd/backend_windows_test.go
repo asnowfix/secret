@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -109,5 +110,33 @@ func TestSelectBackend_Windows_ValueValidOnlyOnAnotherPlatform(t *testing.T) {
 	}
 	if !strings.Contains(msg, ", not "+runtime.GOOS) {
 		t.Errorf("error %q does not say \", not %s\" — selectBackend() may be passing the wrong GOOS literal to errUnrecognisedBackend", msg, runtime.GOOS)
+	}
+}
+
+// The trim itself lives in backendEnvValue (issue #64); this confirms the
+// windows call site goes through it.
+func TestSelectBackend_Windows_EnvWhitespaceIsTrimmed(t *testing.T) {
+	for _, in := range []string{"credential-manager ", " credential-manager", "\tcredential-manager\n", " \t "} {
+		t.Run(fmt.Sprintf("%q", in), func(t *testing.T) {
+			t.Setenv("SECRET_BACKEND", in)
+
+			b, err := selectBackend()
+			if err != nil {
+				t.Fatalf("SECRET_BACKEND=%q: unexpected error: %v", in, err)
+			}
+			if _, ok := b.(*backend.CredentialManager); !ok {
+				t.Fatalf("SECRET_BACKEND=%q: got %T, want *backend.CredentialManager", in, b)
+			}
+		})
+	}
+}
+
+func TestSelectBackend_Windows_WrongCaseStillRejected(t *testing.T) {
+	t.Setenv("SECRET_BACKEND", " Credential-Manager ")
+
+	if b, err := selectBackend(); err == nil {
+		t.Fatalf("expected an error, got backend %T", b)
+	} else if !strings.Contains(err.Error(), `"Credential-Manager"`) {
+		t.Errorf("error %q should show the trimmed value", err.Error())
 	}
 }
