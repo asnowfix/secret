@@ -369,8 +369,9 @@ func (s *SecretService) Add(service, account, password string) error {
 	return nil
 }
 
-// Delete removes every item tagged with attrService == service, across all
-// collections. It does *not* unlock locked items first: per the Secret
+// Delete removes the item tagged with attrService == service, across all
+// collections. If more than one own item matches it deletes nothing and
+// returns *ErrAmbiguous (issue #49); no match is *ErrNotFound. It does *not* unlock locked items first: per the Secret
 // Service spec, Item.Delete removes the item's metadata and secret without
 // requiring the caller to have read the secret first, and gnome-keyring
 // (the only provider this backend has been run against) accepts Delete on
@@ -390,6 +391,12 @@ func (s *SecretService) Delete(service string) error {
 	items := append(append([]dbus.ObjectPath{}, unlocked...), locked...)
 	if len(items) == 0 {
 		return &ErrNotFound{Service: service}
+	}
+	// Refuse, deleting nothing, when the service is ambiguous (issue #49):
+	// the read path picks one item (pickItem) while this would remove all of
+	// them, so a second account's credential would be destroyed silently.
+	if err := ambiguityError(service, len(items)); err != nil {
+		return err
 	}
 	isLocked := make(map[dbus.ObjectPath]bool, len(locked))
 	for _, l := range locked {
@@ -529,9 +536,13 @@ func (s *SecretService) resolveItem(service string) (dbus.ObjectPath, map[string
 
 // pickItem returns the first candidate item, if any. Multiple items can
 // exist for the same service if they were created under different accounts
-// (see Add's doc comment); we deterministically pick the first one Secret
-// Service returns, mirroring the ambiguity accepted by the macOS and
-// Windows backends' single-match-by-service-name lookups.
+// (see Add's doc comment); we pick the first one Secret Service returns,
+// mirroring the ambiguity accepted by the macOS and Windows backends'
+// single-match-by-service-name lookups. That order is stable only within one
+// SearchItems reply: the spec defines no ordering, and the unlocked/locked
+// split can change between calls, so two calls (GetUsername, then Delete)
+// are not guaranteed to agree on which item is first. Delete therefore does
+// not rely on it and refuses on ambiguity instead (*ErrAmbiguous, issue #49).
 func pickItem(candidates []dbus.ObjectPath) (dbus.ObjectPath, bool) {
 	if len(candidates) == 0 {
 		return "", false
