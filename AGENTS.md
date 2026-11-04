@@ -63,6 +63,26 @@ goreleaser release --snapshot --clean --skip=publish  # build all release artefa
 # inspect ./dist/ for archives + checksums.txt
 ```
 
+## Live testing on Linux (GNOME keyring)
+
+On a non-headless Linux box with a live gnome-keyring (the dev host `palmbeach` is one) on the session bus (`org.freedesktop.secrets`, collection `login`), the Secret Service backend can be tested for real instead of mock-only:
+
+```sh
+SECRET_LIVE_DBUS_TEST=1 go test ./backend/... -run TestSecretServiceLive -v -count=1
+```
+
+The git helper check (store/fill/reject through `git credential`) works against it too; use a unique `.invalid` host.
+
+Locked-keyring check: lock the collection, then run `secret password <svc>`:
+
+```sh
+busctl --user call org.freedesktop.secrets /org/freedesktop/secrets org.freedesktop.Secret.Service Lock ao 1 /org/freedesktop/secrets/collection/login
+```
+
+The user must answer or cancel the GNOME dialog; an agent cannot. Locking is reversible here (unlike macOS, #62). Verified 2026-10-28: unlock answered gives the password; Cancel gives `prompt was dismissed` (exit 1); delete while locked gives `IsLocked` with no prompt.
+
+Not yet verified: `set` over an existing item while locked and cancelled, and `list` while locked.
+
 ## Commits and PRs
 
 Do NOT include `Co-Authored-By` trailers or `Generated with Claude Code` strings in commit messages or PR descriptions.
